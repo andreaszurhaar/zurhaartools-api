@@ -169,10 +169,11 @@ export default {
         const result = await response.json();
         const content = result.content[0].text;
 
-        // Parse the JSON response from Claude
+        // Parse the JSON response from Claude (strip markdown code blocks if present)
         let parsed;
         try {
-          parsed = JSON.parse(content);
+          const cleaned = content.replace(/^```(?:json)?\n?/g, '').replace(/\n?```$/g, '').trim();
+          parsed = JSON.parse(cleaned);
         } catch {
           parsed = { raw: content, error: 'Could not parse structured response' };
         }
