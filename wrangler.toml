@@ -1,0 +1,6 @@
+name = "zurhaartools-api"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+[vars]
+ALLOWED_ORIGINS = "https://zurhaartools.com,chrome-extension://*"
