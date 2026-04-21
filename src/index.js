@@ -169,13 +169,24 @@ export default {
         const result = await response.json();
         const content = result.content[0].text;
 
-        // Parse the JSON response from Claude (strip markdown code blocks if present)
+        // Parse the JSON response from Claude
         let parsed;
         try {
+          // Strip markdown code blocks if present
           const cleaned = content.replace(/^```(?:json)?\n?/g, '').replace(/\n?```$/g, '').trim();
           parsed = JSON.parse(cleaned);
         } catch {
-          parsed = { raw: content, error: 'Could not parse structured response' };
+          // Try to extract JSON object from within the response
+          try {
+            const jsonMatch = content.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              parsed = JSON.parse(jsonMatch[0]);
+            } else {
+              parsed = { raw: content, error: 'Could not parse structured response' };
+            }
+          } catch {
+            parsed = { raw: content, error: 'Could not parse structured response' };
+          }
         }
 
         return new Response(JSON.stringify(parsed), {
