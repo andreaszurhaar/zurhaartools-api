@@ -4,3 +4,8 @@ compatibility_date = "2024-12-01"
 
 [vars]
 ALLOWED_ORIGINS = "https://zurhaartools.com,chrome-extension://*"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "zurhaartools-db"
+database_id = "1366e1ef-20c5-4e97-957a-23ec4d03bdca"
