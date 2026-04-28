@@ -5,11 +5,22 @@ const PRODUCT_FOR_TYPE = {
 };
 
 // Maps LemonSqueezy variant IDs to credit amounts
-// Update these after creating products in LemonSqueezy
 const CREDIT_BUNDLES = {
-  // 'variant_id_here': 20,
-  // 'variant_id_here': 50,
-  // 'variant_id_here': 150,
+  '1569582': 50,
+  '1569511': 150,
+  '1569625': 500,
+};
+
+// Maps Stripe price IDs to credit amounts and product info
+const STRIPE_PRICES = {
+  // Test prices
+  'price_1TQmUD2OmqjfvJPqWpjGA7PV': { credits: 50, product: 'job-red-flag-detector', variant: '50 Scans' },
+  'price_1TQmUE2OmqjfvJPqNVYjk4JV': { credits: 150, product: 'job-red-flag-detector', variant: '150 Scans' },
+  'price_1TQmUE2OmqjfvJPqUXdldl3e': { credits: 500, product: 'job-red-flag-detector', variant: '500 Scans' },
+  // Live prices
+  'price_1TQoOk2OmqjfvJPqDzWnbzWZ': { credits: 50, product: 'job-red-flag-detector', variant: '50 Scans' },
+  'price_1TQoOk2OmqjfvJPq844bFp1N': { credits: 150, product: 'job-red-flag-detector', variant: '150 Scans' },
+  'price_1TQoOk2OmqjfvJPqB8j6OW4J': { credits: 500, product: 'job-red-flag-detector', variant: '500 Scans' },
 };
 
 const PROMPTS = {
@@ -165,26 +176,163 @@ export default {
         const payload = JSON.parse(rawBody);
         const eventName = payload.meta?.event_name;
 
-        if (eventName !== 'order_created') {
+        if (eventName === 'order_created') {
+          const email = payload.data?.attributes?.user_email;
+          const orderId = String(payload.data?.id || '');
+          const variantId = String(payload.data?.attributes?.first_order_item?.variant_id || '');
+          const product = payload.meta?.custom_data?.product || 'job-red-flag-detector';
+
+          // Determine credits from variant
+          let credits = CREDIT_BUNDLES[variantId];
+          if (!credits) {
+            credits = parseInt(payload.meta?.custom_data?.credits) || 20;
+          }
+
+          // Idempotency: check if this order was already processed
+          const existingTransaction = await env.DB.prepare(
+            'SELECT id FROM credit_transactions WHERE order_id = ?'
+          ).bind(orderId).first();
+
+          if (existingTransaction) {
+            return jsonResponse({ ok: true, already_processed: true }, 200, origin);
+          }
+
+          // Store order info temporarily — license key will be set by license_key_created event
+          const placeholderKey = `pending:${orderId}`;
+          const existingLicense = await env.DB.prepare(
+            'SELECT license_key, credits_remaining FROM licenses WHERE email = ? AND product = ?'
+          ).bind(email, product).first();
+
+          let licenseKey;
+
+          if (existingLicense) {
+            licenseKey = existingLicense.license_key;
+            await env.DB.prepare(
+              'UPDATE licenses SET credits_remaining = credits_remaining + ?, updated_at = datetime(\'now\') WHERE license_key = ?'
+            ).bind(credits, licenseKey).run();
+          } else {
+            licenseKey = placeholderKey;
+            await env.DB.prepare(
+              'INSERT INTO licenses (license_key, product, email, credits_remaining) VALUES (?, ?, ?, ?)'
+            ).bind(licenseKey, product, email, credits).run();
+          }
+
+          // Record transaction
+          await env.DB.prepare(
+            'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
+          ).bind(licenseKey, credits, `purchase:${credits}`, orderId).run();
+
+          // Log sale to Google Sheets (fire and forget)
+          const orderAttrs = payload.data?.attributes;
+          const item = orderAttrs?.first_order_item;
+          const sheetData = {
+            date: orderAttrs?.created_at?.substring(0, 10) || new Date().toISOString().substring(0, 10),
+            order_id: orderId,
+            product: item?.product_name || product,
+            variant: item?.variant_name || variantId,
+            amount: (orderAttrs?.total || 0) / 100,
+            email: email,
+            test_mode: payload.meta?.test_mode ? 'Yes' : 'No',
+          };
+          try {
+            await fetch(env.GOOGLE_SHEETS_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(sheetData),
+              redirect: 'follow',
+            });
+          } catch (e) { /* don't block on logging failure */ }
+
+          return jsonResponse({ ok: true, license_key: licenseKey }, 200, origin);
+
+        } else if (eventName === 'license_key_created') {
+          // Replace placeholder key with the real LemonSqueezy license key
+          const licenseKey = payload.data?.attributes?.key;
+          const orderId = String(payload.data?.attributes?.order_id || '');
+          const placeholderKey = `pending:${orderId}`;
+
+          if (licenseKey && orderId) {
+            await env.DB.batch([
+              env.DB.prepare('UPDATE credit_transactions SET license_key = ? WHERE license_key = ?').bind(licenseKey, placeholderKey),
+              env.DB.prepare('UPDATE licenses SET license_key = ?, updated_at = datetime(\'now\') WHERE license_key = ?').bind(licenseKey, placeholderKey),
+            ]);
+          }
+
+          return jsonResponse({ ok: true, license_key: licenseKey }, 200, origin);
+
+        } else {
+          return jsonResponse({ ok: true, skipped: true }, 200, origin);
+        }
+      } catch (err) {
+        console.error('Webhook error:', err);
+        return jsonResponse({ error: 'Webhook processing failed' }, 500, origin);
+      }
+    }
+
+    // ──────────────────────────────────────────────
+    // Stripe webhook: creates/tops up licenses
+    // ──────────────────────────────────────────────
+    if (url.pathname === '/webhooks/stripe' && request.method === 'POST') {
+      try {
+        const rawBody = await request.text();
+        const sigHeader = request.headers.get('stripe-signature');
+
+        // Verify Stripe signature
+        if (env.STRIPE_WEBHOOK_SECRET && sigHeader) {
+          const parts = {};
+          sigHeader.split(',').forEach(p => {
+            const [k, v] = p.split('=');
+            parts[k] = v;
+          });
+          const timestamp = parts.t;
+          const sig = parts.v1;
+          const signedPayload = `${timestamp}.${rawBody}`;
+          const encoder = new TextEncoder();
+          const key = await crypto.subtle.importKey(
+            'raw', encoder.encode(env.STRIPE_WEBHOOK_SECRET),
+            { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+          );
+          const signed = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
+          const expected = Array.from(new Uint8Array(signed)).map(b => b.toString(16).padStart(2, '0')).join('');
+          if (expected !== sig) {
+            return jsonResponse({ error: 'Invalid signature' }, 401, origin);
+          }
+        }
+
+        const event = JSON.parse(rawBody);
+
+        if (event.type !== 'checkout.session.completed') {
           return jsonResponse({ ok: true, skipped: true }, 200, origin);
         }
 
-        const email = payload.data?.attributes?.user_email;
-        const orderId = String(payload.data?.id || '');
-        const variantId = String(payload.data?.attributes?.first_order_item?.variant_id || '');
-        const product = payload.meta?.custom_data?.product || 'job-red-flag-detector';
+        const session = event.data.object;
+        const email = session.customer_details?.email;
+        const sessionId = session.id;
+        const amountTotal = session.amount_total || 0;
+        const currency = session.currency || 'eur';
+        const country = session.customer_details?.address?.country || '';
+        const testMode = event.livemode === false;
 
-        // Determine credits from variant
-        let credits = CREDIT_BUNDLES[variantId];
-        if (!credits) {
-          // Fallback: check custom_data for credits amount
-          credits = parseInt(payload.meta?.custom_data?.credits) || 20;
+        // Get line items to determine which price was purchased
+        const lineItemsResponse = await fetch(
+          `https://api.stripe.com/v1/checkout/sessions/${sessionId}/line_items`,
+          { headers: { 'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}` } }
+        );
+        const lineItems = await lineItemsResponse.json();
+        const priceId = lineItems.data?.[0]?.price?.id;
+        const priceInfo = STRIPE_PRICES[priceId];
+
+        if (!priceInfo) {
+          console.error('Unknown Stripe price ID:', priceId);
+          return jsonResponse({ error: 'Unknown price' }, 400, origin);
         }
 
-        // Idempotency: check if this order was already processed
+        const { credits, product, variant } = priceInfo;
+
+        // Idempotency: check if this session was already processed
         const existingTransaction = await env.DB.prepare(
           'SELECT id FROM credit_transactions WHERE order_id = ?'
-        ).bind(orderId).first();
+        ).bind(sessionId).first();
 
         if (existingTransaction) {
           return jsonResponse({ ok: true, already_processed: true }, 200, origin);
@@ -198,14 +346,12 @@ export default {
         let licenseKey;
 
         if (existingLicense) {
-          // Top up existing license
           licenseKey = existingLicense.license_key;
           await env.DB.prepare(
             'UPDATE licenses SET credits_remaining = credits_remaining + ?, updated_at = datetime(\'now\') WHERE license_key = ?'
           ).bind(credits, licenseKey).run();
         } else {
-          // Create new license
-          licenseKey = crypto.randomUUID();
+          licenseKey = crypto.randomUUID().toUpperCase();
           await env.DB.prepare(
             'INSERT INTO licenses (license_key, product, email, credits_remaining) VALUES (?, ?, ?, ?)'
           ).bind(licenseKey, product, email, credits).run();
@@ -214,13 +360,88 @@ export default {
         // Record transaction
         await env.DB.prepare(
           'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
-        ).bind(licenseKey, credits, `purchase:${credits}`, orderId).run();
+        ).bind(licenseKey, credits, `purchase:${credits}`, sessionId).run();
+
+        // Log sale to Google Sheets
+        const sheetData = {
+          date: new Date().toISOString().substring(0, 10),
+          order_id: sessionId,
+          product: `Job Red Flag Detector`,
+          variant: variant,
+          amount: amountTotal / 100,
+          email: email,
+          test_mode: testMode ? 'Yes' : 'No',
+          country: country,
+        };
+        try {
+          await fetch(env.GOOGLE_SHEETS_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(sheetData),
+            redirect: 'follow',
+          });
+        } catch (e) { /* don't block on logging failure */ }
+
+        // Send license key email via Resend
+        const totalCredits = existingLicense
+          ? existingLicense.credits_remaining + credits
+          : credits;
+        try {
+          await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              from: 'Zurhaar Tools <andreas@zurhaartools.com>',
+              to: email,
+              subject: `Your license key — ${variant}`,
+              html: `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+  <h2 style="color: #f97316;">Thanks for your purchase!</h2>
+  <p>Here is your license key for the <strong>Job Red Flag Detector</strong>:</p>
+  <div style="background: #12121a; border: 1px solid #2e2e42; border-radius: 8px; padding: 16px; margin: 20px 0;">
+    <code style="color: #fb923c; font-size: 16px; word-break: break-all;">${licenseKey}</code>
+  </div>
+  <p><strong>Credits:</strong> ${totalCredits} scans available</p>
+  <h3>How to use</h3>
+  <ol>
+    <li>Install the Job Red Flag Detector from the Chrome Web Store</li>
+    <li>Open the extension and paste your license key</li>
+    <li>Navigate to any job posting and click Scan</li>
+  </ol>
+  <p style="color: #94a3b8; font-size: 14px; margin-top: 30px;">Need help? Reply to this email or contact <a href="mailto:andreas@zurhaartools.com" style="color: #fb923c;">andreas@zurhaartools.com</a></p>
+  <p style="color: #94a3b8; font-size: 12px;">Zurhaar Tools — <a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a></p>
+</div>`,
+            }),
+          });
+        } catch (e) { /* don't block on email failure */ }
 
         return jsonResponse({ ok: true, license_key: licenseKey }, 200, origin);
       } catch (err) {
-        console.error('Webhook error:', err);
+        console.error('Stripe webhook error:', err);
         return jsonResponse({ error: 'Webhook processing failed' }, 500, origin);
       }
+    }
+
+    // ──────────────────────────────────────────────
+    // License key lookup by session ID (for success page)
+    // ──────────────────────────────────────────────
+    if (url.pathname === '/api/license' && request.method === 'GET') {
+      const sessionId = url.searchParams.get('session_id');
+      if (!sessionId) {
+        return jsonResponse({ error: 'Missing session_id' }, 400, origin);
+      }
+      const transaction = await env.DB.prepare(
+        'SELECT license_key FROM credit_transactions WHERE order_id = ?'
+      ).bind(sessionId).first();
+      if (!transaction) {
+        return jsonResponse({ error: 'not_found' }, 404, origin);
+      }
+      const license = await env.DB.prepare(
+        'SELECT license_key, credits_remaining, product FROM licenses WHERE license_key = ?'
+      ).bind(transaction.license_key).first();
+      return jsonResponse(license || { error: 'not_found' }, license ? 200 : 404, origin);
     }
 
     // ──────────────────────────────────────────────
