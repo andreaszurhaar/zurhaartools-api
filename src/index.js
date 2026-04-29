@@ -4,13 +4,6 @@ const PRODUCT_FOR_TYPE = {
   'tos-scan': 'tos-scanner',
 };
 
-// Maps LemonSqueezy variant IDs to credit amounts
-const CREDIT_BUNDLES = {
-  '1569582': 50,
-  '1569511': 150,
-  '1569625': 500,
-};
-
 // Maps Stripe price IDs to credit amounts and product info
 const STRIPE_PRICES = {
   // Test prices
@@ -126,22 +119,6 @@ function jsonResponse(data, status, origin) {
   });
 }
 
-async function verifyWebhookSignature(body, signature, secret) {
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  const signed = await crypto.subtle.sign('HMAC', key, encoder.encode(body));
-  const expected = Array.from(new Uint8Array(signed))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-  return expected === signature;
-}
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -155,118 +132,6 @@ export default {
     // Health check
     if (url.pathname === '/health') {
       return jsonResponse({ status: 'ok' }, 200, origin);
-    }
-
-    // ──────────────────────────────────────────────
-    // LemonSqueezy webhook: creates/tops up licenses
-    // ──────────────────────────────────────────────
-    if (url.pathname === '/webhooks/lemonsqueezy' && request.method === 'POST') {
-      try {
-        const rawBody = await request.text();
-        const signature = request.headers.get('X-Signature');
-
-        // Verify signature
-        if (env.LEMONSQUEEZY_WEBHOOK_SECRET && signature) {
-          const valid = await verifyWebhookSignature(rawBody, signature, env.LEMONSQUEEZY_WEBHOOK_SECRET);
-          if (!valid) {
-            return jsonResponse({ error: 'Invalid signature' }, 401, origin);
-          }
-        }
-
-        const payload = JSON.parse(rawBody);
-        const eventName = payload.meta?.event_name;
-
-        if (eventName === 'order_created') {
-          const email = payload.data?.attributes?.user_email;
-          const orderId = String(payload.data?.id || '');
-          const variantId = String(payload.data?.attributes?.first_order_item?.variant_id || '');
-          const product = payload.meta?.custom_data?.product || 'job-red-flag-detector';
-
-          // Determine credits from variant
-          let credits = CREDIT_BUNDLES[variantId];
-          if (!credits) {
-            credits = parseInt(payload.meta?.custom_data?.credits) || 20;
-          }
-
-          // Idempotency: check if this order was already processed
-          const existingTransaction = await env.DB.prepare(
-            'SELECT id FROM credit_transactions WHERE order_id = ?'
-          ).bind(orderId).first();
-
-          if (existingTransaction) {
-            return jsonResponse({ ok: true, already_processed: true }, 200, origin);
-          }
-
-          // Store order info temporarily — license key will be set by license_key_created event
-          const placeholderKey = `pending:${orderId}`;
-          const existingLicense = await env.DB.prepare(
-            'SELECT license_key, credits_remaining FROM licenses WHERE email = ? AND product = ?'
-          ).bind(email, product).first();
-
-          let licenseKey;
-
-          if (existingLicense) {
-            licenseKey = existingLicense.license_key;
-            await env.DB.prepare(
-              'UPDATE licenses SET credits_remaining = credits_remaining + ?, updated_at = datetime(\'now\') WHERE license_key = ?'
-            ).bind(credits, licenseKey).run();
-          } else {
-            licenseKey = placeholderKey;
-            await env.DB.prepare(
-              'INSERT INTO licenses (license_key, product, email, credits_remaining) VALUES (?, ?, ?, ?)'
-            ).bind(licenseKey, product, email, credits).run();
-          }
-
-          // Record transaction
-          await env.DB.prepare(
-            'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
-          ).bind(licenseKey, credits, `purchase:${credits}`, orderId).run();
-
-          // Log sale to Google Sheets (fire and forget)
-          const orderAttrs = payload.data?.attributes;
-          const item = orderAttrs?.first_order_item;
-          const sheetData = {
-            date: orderAttrs?.created_at?.substring(0, 10) || new Date().toISOString().substring(0, 10),
-            order_id: orderId,
-            product: item?.product_name || product,
-            variant: item?.variant_name || variantId,
-            amount: (orderAttrs?.total || 0) / 100,
-            email: email,
-            test_mode: payload.meta?.test_mode ? 'Yes' : 'No',
-          };
-          try {
-            await fetch(env.GOOGLE_SHEETS_URL, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(sheetData),
-              redirect: 'follow',
-            });
-          } catch (e) { /* don't block on logging failure */ }
-
-          return jsonResponse({ ok: true, license_key: licenseKey }, 200, origin);
-
-        } else if (eventName === 'license_key_created') {
-          // Replace placeholder key with the real LemonSqueezy license key
-          const licenseKey = payload.data?.attributes?.key;
-          const orderId = String(payload.data?.attributes?.order_id || '');
-          const placeholderKey = `pending:${orderId}`;
-
-          if (licenseKey && orderId) {
-            await env.DB.batch([
-              env.DB.prepare('UPDATE credit_transactions SET license_key = ? WHERE license_key = ?').bind(licenseKey, placeholderKey),
-              env.DB.prepare('UPDATE licenses SET license_key = ?, updated_at = datetime(\'now\') WHERE license_key = ?').bind(licenseKey, placeholderKey),
-            ]);
-          }
-
-          return jsonResponse({ ok: true, license_key: licenseKey }, 200, origin);
-
-        } else {
-          return jsonResponse({ ok: true, skipped: true }, 200, origin);
-        }
-      } catch (err) {
-        console.error('Webhook error:', err);
-        return jsonResponse({ error: 'Webhook processing failed' }, 500, origin);
-      }
     }
 
     // ──────────────────────────────────────────────
