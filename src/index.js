@@ -142,26 +142,27 @@ export default {
         const rawBody = await request.text();
         const sigHeader = request.headers.get('stripe-signature');
 
-        // Verify Stripe signature
-        if (env.STRIPE_WEBHOOK_SECRET && sigHeader) {
-          const parts = {};
-          sigHeader.split(',').forEach(p => {
-            const [k, v] = p.split('=');
-            parts[k] = v;
-          });
-          const timestamp = parts.t;
-          const sig = parts.v1;
-          const signedPayload = `${timestamp}.${rawBody}`;
-          const encoder = new TextEncoder();
-          const key = await crypto.subtle.importKey(
-            'raw', encoder.encode(env.STRIPE_WEBHOOK_SECRET),
-            { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-          );
-          const signed = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
-          const expected = Array.from(new Uint8Array(signed)).map(b => b.toString(16).padStart(2, '0')).join('');
-          if (expected !== sig) {
-            return jsonResponse({ error: 'Invalid signature' }, 401, origin);
-          }
+        // Verify Stripe signature — always required
+        if (!env.STRIPE_WEBHOOK_SECRET || !sigHeader) {
+          return jsonResponse({ error: 'Missing signature' }, 401, origin);
+        }
+        const parts = {};
+        sigHeader.split(',').forEach(p => {
+          const [k, v] = p.split('=');
+          parts[k] = v;
+        });
+        const timestamp = parts.t;
+        const sig = parts.v1;
+        const signedPayload = `${timestamp}.${rawBody}`;
+        const encoder = new TextEncoder();
+        const key = await crypto.subtle.importKey(
+          'raw', encoder.encode(env.STRIPE_WEBHOOK_SECRET),
+          { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+        );
+        const signed = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
+        const expected = Array.from(new Uint8Array(signed)).map(b => b.toString(16).padStart(2, '0')).join('');
+        if (expected !== sig) {
+          return jsonResponse({ error: 'Invalid signature' }, 401, origin);
         }
 
         const event = JSON.parse(rawBody);
