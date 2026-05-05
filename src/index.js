@@ -4,6 +4,12 @@ const PRODUCT_FOR_TYPE = {
   'tos-scan': 'tos-scanner',
 };
 
+// Human-readable product names for emails and logging
+const PRODUCT_DISPLAY_NAMES = {
+  'job-red-flag-detector': 'Job Red Flag Detector',
+  'tos-scanner': 'ToS Scanner',
+};
+
 // Maps Stripe price IDs to credit amounts and product info
 const STRIPE_PRICES = {
   // Test prices
@@ -103,13 +109,24 @@ Text to analyze:
 `,
 };
 
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  if (origin === 'https://zurhaartools.com') return true;
+  if (origin.startsWith('chrome-extension://')) return true;
+  if (origin.startsWith('extension://')) return true;
+  return false;
+}
+
 function corsHeaders(origin) {
-  return {
-    'Access-Control-Allow-Origin': origin || '*',
+  const headers = {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
   };
+  if (isAllowedOrigin(origin)) {
+    headers['Access-Control-Allow-Origin'] = origin;
+  }
+  return headers;
 }
 
 function jsonResponse(data, status, origin) {
@@ -184,13 +201,17 @@ export default {
           `https://api.stripe.com/v1/checkout/sessions/${sessionId}/line_items`,
           { headers: { 'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}` } }
         );
+        if (!lineItemsResponse.ok) {
+          console.error('Stripe line_items API error:', lineItemsResponse.status);
+          return jsonResponse({ error: 'Failed to fetch line items' }, 500, origin);
+        }
         const lineItems = await lineItemsResponse.json();
         const priceId = lineItems.data?.[0]?.price?.id;
         const priceInfo = STRIPE_PRICES[priceId];
 
         if (!priceInfo) {
           console.error('Unknown Stripe price ID:', priceId);
-          return jsonResponse({ error: 'Unknown price' }, 400, origin);
+          return jsonResponse({ error: 'Unknown price' }, 500, origin);
         }
 
         const { credits, product, variant } = priceInfo;
@@ -229,10 +250,11 @@ export default {
         ).bind(licenseKey, credits, `purchase:${credits}`, sessionId).run();
 
         // Log sale to Google Sheets
+        const productName = PRODUCT_DISPLAY_NAMES[product] || product;
         const sheetData = {
           date: new Date().toISOString().substring(0, 10),
           order_id: sessionId,
-          product: `Job Red Flag Detector`,
+          product: productName,
           variant: variant,
           amount: amountTotal / 100,
           email: email,
@@ -262,19 +284,19 @@ export default {
             body: JSON.stringify({
               from: 'Zurhaar Tools <andreas@zurhaartools.com>',
               to: email,
-              subject: `Your license key — ${variant}`,
+              subject: `Your license key — ${productName} ${variant}`,
               html: `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
   <h2 style="color: #f97316;">Thanks for your purchase!</h2>
-  <p>Here is your license key for the <strong>Job Red Flag Detector</strong>:</p>
+  <p>Here is your license key for the <strong>${productName}</strong>:</p>
   <div style="background: #12121a; border: 1px solid #2e2e42; border-radius: 8px; padding: 16px; margin: 20px 0;">
     <code style="color: #fb923c; font-size: 16px; word-break: break-all;">${licenseKey}</code>
   </div>
   <p><strong>Credits:</strong> ${totalCredits} scans available</p>
   <h3>How to use</h3>
   <ol>
-    <li>Install the Job Red Flag Detector from the Chrome Web Store</li>
+    <li>Install the ${productName} browser extension</li>
     <li>Open the extension and paste your license key</li>
-    <li>Navigate to any job posting and click Scan</li>
+    <li>Start scanning</li>
   </ol>
   <p style="color: #94a3b8; font-size: 14px; margin-top: 30px;">Need help? Reply to this email or contact <a href="mailto:andreas@zurhaartools.com" style="color: #fb923c;">andreas@zurhaartools.com</a></p>
   <p style="color: #94a3b8; font-size: 12px;">Zurhaar Tools — <a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a></p>
@@ -331,31 +353,6 @@ export default {
       return jsonResponse({
         credits_remaining: license.credits_remaining,
         product: license.product,
-      }, 200, origin);
-    }
-
-    // ──────────────────────────────────────────────
-    // License lookup: find license key by email + product
-    // ──────────────────────────────────────────────
-    if (url.pathname === '/api/license-lookup' && request.method === 'GET') {
-      const email = url.searchParams.get('email');
-      const product = url.searchParams.get('product');
-
-      if (!email || !product) {
-        return jsonResponse({ error: 'Missing email or product parameter' }, 400, origin);
-      }
-
-      const license = await env.DB.prepare(
-        'SELECT license_key, credits_remaining FROM licenses WHERE email = ? AND product = ?'
-      ).bind(email, product).first();
-
-      if (!license) {
-        return jsonResponse({ error: 'No license found for this email and product.' }, 404, origin);
-      }
-
-      return jsonResponse({
-        license_key: license.license_key,
-        credits_remaining: license.credits_remaining,
       }, 200, origin);
     }
 
