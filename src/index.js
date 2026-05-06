@@ -270,6 +270,22 @@ export default {
           });
         } catch (e) { /* don't block on logging failure */ }
 
+        // Log Stripe fee as expense
+        const saleAmount = amountTotal / 100;
+        const stripeFee = Math.round((saleAmount * 0.015 + 0.25) * 100) / 100;
+        try {
+          const feeParams = new URLSearchParams({
+            action: 'addExpense',
+            date: sheetData.date,
+            supplier: 'Stripe',
+            description: `Payment processing fee (${sessionId})`,
+            category: 'Fees',
+            amount: String(stripeFee),
+            key: env.GOOGLE_SHEETS_API_KEY,
+          });
+          await fetch(`${env.GOOGLE_SHEETS_URL}?${feeParams}`, { redirect: 'follow' });
+        } catch (e) { /* don't block on fee logging failure */ }
+
         // Send license key email via Resend
         const totalCredits = existingLicense
           ? existingLicense.credits_remaining + credits
