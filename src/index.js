@@ -159,8 +159,12 @@ export default {
         const rawBody = await request.text();
         const sigHeader = request.headers.get('stripe-signature');
 
-        // Verify Stripe signature — always required
-        if (!env.STRIPE_WEBHOOK_SECRET || !sigHeader) {
+        // Verify Stripe signature — try live secret first, then test secret
+        if (!sigHeader) {
+          return jsonResponse({ error: 'Missing signature' }, 401, origin);
+        }
+        const secrets = [env.STRIPE_WEBHOOK_SECRET, env.STRIPE_WEBHOOK_SECRET_TEST].filter(Boolean);
+        if (secrets.length === 0) {
           return jsonResponse({ error: 'Missing signature' }, 401, origin);
         }
         const parts = {};
@@ -172,13 +176,20 @@ export default {
         const sig = parts.v1;
         const signedPayload = `${timestamp}.${rawBody}`;
         const encoder = new TextEncoder();
-        const key = await crypto.subtle.importKey(
-          'raw', encoder.encode(env.STRIPE_WEBHOOK_SECRET),
-          { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-        );
-        const signed = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
-        const expected = Array.from(new Uint8Array(signed)).map(b => b.toString(16).padStart(2, '0')).join('');
-        if (expected !== sig) {
+        let signatureValid = false;
+        for (const secret of secrets) {
+          const key = await crypto.subtle.importKey(
+            'raw', encoder.encode(secret),
+            { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+          );
+          const signed = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
+          const expected = Array.from(new Uint8Array(signed)).map(b => b.toString(16).padStart(2, '0')).join('');
+          if (expected === sig) {
+            signatureValid = true;
+            break;
+          }
+        }
+        if (!signatureValid) {
           return jsonResponse({ error: 'Invalid signature' }, 401, origin);
         }
 
