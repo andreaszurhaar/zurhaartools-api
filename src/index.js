@@ -214,7 +214,7 @@ export default {
           { headers: { 'Authorization': `Bearer ${stripeKey}` } }
         );
         if (!lineItemsResponse.ok) {
-          console.error('Stripe line_items API error:', lineItemsResponse.status);
+          console.error(`[WEBHOOK_ERROR] Stripe line_items API error ${lineItemsResponse.status} | session=${sessionId}`);
           return jsonResponse({ error: 'Failed to fetch line items' }, 500, origin);
         }
         const lineItems = await lineItemsResponse.json();
@@ -222,7 +222,7 @@ export default {
         const priceInfo = STRIPE_PRICES[priceId];
 
         if (!priceInfo) {
-          console.error('Unknown Stripe price ID:', priceId);
+          console.error(`[WEBHOOK_ERROR] Unknown Stripe price ID ${priceId} | session=${sessionId}`);
           return jsonResponse({ error: 'Unknown price' }, 500, origin);
         }
 
@@ -280,7 +280,9 @@ export default {
             body: JSON.stringify(sheetData),
             redirect: 'follow',
           });
-        } catch (e) { /* don't block on logging failure */ }
+        } catch (e) {
+          console.error(`[SHEETS_ERROR] Failed to log sale | order=${sessionId} email=${email}`, e.message || e);
+        }
 
         // Log Stripe fee as expense
         const saleAmount = amountTotal / 100;
@@ -296,7 +298,9 @@ export default {
             key: env.GOOGLE_SHEETS_API_KEY,
           });
           await fetch(`${env.GOOGLE_SHEETS_URL}?${feeParams}`, { redirect: 'follow' });
-        } catch (e) { /* don't block on fee logging failure */ }
+        } catch (e) {
+          console.error(`[SHEETS_ERROR] Failed to log Stripe fee | order=${sessionId}`, e.message || e);
+        }
 
         // Send license key email via Resend
         const totalCredits = existingLicense
@@ -331,11 +335,13 @@ export default {
 </div>`,
             }),
           });
-        } catch (e) { /* don't block on email failure */ }
+        } catch (e) {
+          console.error(`[EMAIL_ERROR] Failed to send license key email | order=${sessionId} email=${email}`, e.message || e);
+        }
 
         return jsonResponse({ ok: true, license_key: licenseKey }, 200, origin);
       } catch (err) {
-        console.error('Stripe webhook error:', err);
+        console.error(`[WEBHOOK_ERROR] Stripe webhook processing failed`, err.message || err);
         return jsonResponse({ error: 'Webhook processing failed' }, 500, origin);
       }
     }
@@ -472,7 +478,7 @@ export default {
           await env.DB.prepare(
             'INSERT INTO credit_transactions (license_key, change, reason) VALUES (?, 1, ?)'
           ).bind(license_key, 'refund:api_error').run();
-          console.error('Claude API fetch error:', fetchErr);
+          console.error(`[SCAN_ERROR] Claude API unreachable | type=${type} key=${license_key}`, fetchErr.message || fetchErr);
           return jsonResponse({ error: 'Analysis service temporarily unavailable' }, 502, origin);
         }
 
@@ -485,7 +491,7 @@ export default {
             'INSERT INTO credit_transactions (license_key, change, reason) VALUES (?, 1, ?)'
           ).bind(license_key, 'refund:api_error').run();
           const errorText = await claudeResponse.text();
-          console.error('Anthropic API error:', errorText);
+          console.error(`[SCAN_ERROR] Claude API error ${claudeResponse.status} | type=${type} key=${license_key}`, errorText);
           return jsonResponse({ error: 'Analysis service temporarily unavailable' }, 502, origin);
         }
 
@@ -519,7 +525,7 @@ export default {
 
         return jsonResponse(parsed, 200, origin);
       } catch (err) {
-        console.error('Request error:', err);
+        console.error(`[SCAN_ERROR] Request processing failed`, err.message || err);
         return jsonResponse({ error: 'Internal server error' }, 500, origin);
       }
     }
