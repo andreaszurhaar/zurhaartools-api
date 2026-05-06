@@ -208,9 +208,10 @@ export default {
         const testMode = event.livemode === false;
 
         // Get line items to determine which price was purchased
+        const stripeKey = testMode ? (env.STRIPE_SECRET_KEY_TEST || env.STRIPE_SECRET_KEY) : env.STRIPE_SECRET_KEY;
         const lineItemsResponse = await fetch(
           `https://api.stripe.com/v1/checkout/sessions/${sessionId}/line_items`,
-          { headers: { 'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}` } }
+          { headers: { 'Authorization': `Bearer ${stripeKey}` } }
         );
         if (!lineItemsResponse.ok) {
           console.error('Stripe line_items API error:', lineItemsResponse.status);
