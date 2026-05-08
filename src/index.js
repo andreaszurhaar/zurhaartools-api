@@ -806,6 +806,63 @@ export default {
       }
     }
 
+    // ──────────────────────────────────────────────
+    // Admin: GDPR customer data deletion (anonymization)
+    // ──────────────────────────────────────────────
+    if (url.pathname === '/api/admin/delete-customer' && request.method === 'POST') {
+      // Authenticate with ADMIN_API_KEY
+      const authHeader = request.headers.get('Authorization') || '';
+      const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+      if (!token || token !== env.ADMIN_API_KEY) {
+        return jsonResponse({ error: 'Unauthorized' }, 401, origin);
+      }
+
+      try {
+        const body = await request.json();
+        const { email } = body;
+
+        if (!email) {
+          return jsonResponse({ error: 'Missing email field' }, 400, origin);
+        }
+
+        // Find all licenses for this email
+        const licenses = await env.DB.prepare(
+          'SELECT id, license_key FROM licenses WHERE email = ?'
+        ).bind(email).all();
+
+        if (!licenses.results || licenses.results.length === 0) {
+          return jsonResponse({ error: 'No customer found with this email' }, 404, origin);
+        }
+
+        let transactionsAnonymized = 0;
+
+        for (const license of licenses.results) {
+          const anonymizedKey = `DELETED-${license.id}`;
+
+          // Anonymize credit_transactions first (foreign key reference)
+          const txResult = await env.DB.prepare(
+            'UPDATE credit_transactions SET license_key = ? WHERE license_key = ?'
+          ).bind(anonymizedKey, license.license_key).run();
+          transactionsAnonymized += txResult.meta.changes;
+
+          // Anonymize the license
+          await env.DB.prepare(
+            'UPDATE licenses SET email = ?, license_key = ?, credits_remaining = 0, status = \'deleted\', updated_at = datetime(\'now\') WHERE id = ?'
+          ).bind('deleted@anonymized.invalid', anonymizedKey, license.id).run();
+        }
+
+        console.log(`[GDPR] Customer data anonymized | email=${email} licenses=${licenses.results.length} transactions=${transactionsAnonymized}`);
+        return jsonResponse({
+          ok: true,
+          licenses_anonymized: licenses.results.length,
+          transactions_anonymized: transactionsAnonymized,
+        }, 200, origin);
+      } catch (err) {
+        console.error(`[GDPR_ERROR] Customer deletion failed`, err.message || err);
+        return jsonResponse({ error: 'Deletion failed' }, 500, origin);
+      }
+    }
+
     // 404 for everything else
     return jsonResponse({ error: 'Not found' }, 404, origin);
   },

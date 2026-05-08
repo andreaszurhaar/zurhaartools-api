@@ -40,6 +40,7 @@ wrangler.toml             ← Worker config (D1 binding, CORS origins)
 - `/api/scan` — AI scanning endpoint (validates license, deducts credit, calls Claude)
 - `/api/credits` — returns remaining credits for a license key
 - `/api/license` — looks up license by Stripe session ID (for success page)
+- `/api/admin/delete-customer` — GDPR data deletion (anonymizes customer across D1, requires ADMIN_API_KEY)
 
 ## Database schema
 ```sql
@@ -51,6 +52,7 @@ credit_transactions (id, license_key, change, reason, order_id, created_at)
 - `active` — normal, can scan
 - `suspended` — refunded, credits zeroed out (reactivated on new purchase)
 - `revoked` — chargeback, permanently blocked (stays revoked even on new purchase)
+- `deleted` — GDPR erasure, data anonymized (email/license_key replaced, credits zeroed)
 
 ## Secrets (stored in Cloudflare, set via `wrangler secret put`)
 - `STRIPE_SECRET_KEY` — live Stripe API key
@@ -58,6 +60,7 @@ credit_transactions (id, license_key, change, reason, order_id, created_at)
 - `RESEND_API_KEY` — email delivery
 - `GOOGLE_SHEETS_URL` — Apps Script URL for sale logging
 - `ANTHROPIC_API_KEY` — Claude API for scanning
+- `ADMIN_API_KEY` — admin endpoint auth (GDPR deletion)
 
 ## Deploy
 ```bash
