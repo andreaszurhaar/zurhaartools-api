@@ -4,6 +4,7 @@ CREATE TABLE licenses (
   product TEXT NOT NULL,
   email TEXT NOT NULL,
   credits_remaining INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

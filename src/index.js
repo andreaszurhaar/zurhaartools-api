@@ -136,6 +136,261 @@ function jsonResponse(data, status, origin) {
   });
 }
 
+// ──────────────────────────────────────────────
+// Refund handler: deducts credits, suspends if empty
+// ──────────────────────────────────────────────
+async function handleRefund(event, env, origin) {
+  const charge = event.data.object;
+  const chargeId = charge.id;
+  const paymentIntentId = charge.payment_intent;
+  const refundAmount = charge.amount_refunded / 100;
+  const testMode = event.livemode === false;
+
+  // Idempotency: check if this refund was already processed
+  const existing = await env.DB.prepare(
+    'SELECT id FROM credit_transactions WHERE order_id = ?'
+  ).bind(chargeId).first();
+  if (existing) {
+    return jsonResponse({ ok: true, already_processed: true }, 200, origin);
+  }
+
+  // Find the original purchase by looking up the checkout session via Stripe API
+  const stripeKey = testMode ? (env.STRIPE_SECRET_KEY_TEST || env.STRIPE_SECRET_KEY) : env.STRIPE_SECRET_KEY;
+  const sessionsResponse = await fetch(
+    `https://api.stripe.com/v1/checkout/sessions?payment_intent=${paymentIntentId}&limit=1`,
+    { headers: { 'Authorization': `Bearer ${stripeKey}` } }
+  );
+  if (!sessionsResponse.ok) {
+    console.error(`[REFUND_ERROR] Failed to look up session for payment_intent=${paymentIntentId}`);
+    return jsonResponse({ error: 'Failed to look up original session' }, 500, origin);
+  }
+  const sessions = await sessionsResponse.json();
+  const sessionId = sessions.data?.[0]?.id;
+  if (!sessionId) {
+    console.error(`[REFUND_ERROR] No session found for payment_intent=${paymentIntentId}`);
+    return jsonResponse({ error: 'Original session not found' }, 500, origin);
+  }
+
+  // Find the license from the original purchase transaction
+  const purchaseTransaction = await env.DB.prepare(
+    'SELECT license_key, change FROM credit_transactions WHERE order_id = ? AND reason LIKE \'purchase:%\''
+  ).bind(sessionId).first();
+  if (!purchaseTransaction) {
+    console.error(`[REFUND_ERROR] No purchase transaction found for session=${sessionId}`);
+    return jsonResponse({ error: 'Original purchase not found' }, 500, origin);
+  }
+
+  const licenseKey = purchaseTransaction.license_key;
+  const originalCredits = purchaseTransaction.change;
+
+  // Deduct the originally purchased credits (not what remains)
+  const license = await env.DB.prepare(
+    'SELECT credits_remaining, product FROM licenses WHERE license_key = ?'
+  ).bind(licenseKey).first();
+  if (!license) {
+    console.error(`[REFUND_ERROR] License not found for key=${licenseKey}`);
+    return jsonResponse({ error: 'License not found' }, 500, origin);
+  }
+
+  const creditsToDeduct = Math.min(originalCredits, license.credits_remaining);
+  const newCredits = license.credits_remaining - creditsToDeduct;
+  const newStatus = newCredits <= 0 ? 'suspended' : 'active';
+
+  await env.DB.prepare(
+    'UPDATE licenses SET credits_remaining = ?, status = ?, updated_at = datetime(\'now\') WHERE license_key = ?'
+  ).bind(newCredits, newStatus, licenseKey).run();
+
+  await env.DB.prepare(
+    'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
+  ).bind(licenseKey, -creditsToDeduct, `refund:${chargeId}`, chargeId).run();
+
+  // Log refund as negative sale in Google Sheets
+  const productName = PRODUCT_DISPLAY_NAMES[license.product] || license.product;
+  try {
+    await fetch(env.GOOGLE_SHEETS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        date: new Date().toISOString().substring(0, 10),
+        order_id: chargeId,
+        product: productName,
+        variant: 'Refund',
+        amount: -refundAmount,
+        email: '',
+        test_mode: testMode ? 'Yes' : 'No',
+        country: '',
+      }),
+      redirect: 'follow',
+    });
+  } catch (e) {
+    console.error(`[SHEETS_ERROR] Failed to log refund | charge=${chargeId}`, e.message || e);
+  }
+
+  console.log(`[REFUND] Processed refund for charge=${chargeId} license=${licenseKey} credits_deducted=${creditsToDeduct} new_status=${newStatus}`);
+  return jsonResponse({ ok: true, license_key: licenseKey, credits_deducted: creditsToDeduct, status: newStatus }, 200, origin);
+}
+
+// ──────────────────────────────────────────────
+// Dispute created handler: immediately revokes license
+// ──────────────────────────────────────────────
+async function handleDisputeCreated(event, env, origin) {
+  const dispute = event.data.object;
+  const disputeId = dispute.id;
+  const chargeId = dispute.charge;
+  const disputeAmount = dispute.amount / 100;
+  const testMode = event.livemode === false;
+
+  // Idempotency
+  const existing = await env.DB.prepare(
+    'SELECT id FROM credit_transactions WHERE order_id = ?'
+  ).bind(disputeId).first();
+  if (existing) {
+    return jsonResponse({ ok: true, already_processed: true }, 200, origin);
+  }
+
+  // Look up the charge to get payment_intent, then find the session
+  const stripeKey = testMode ? (env.STRIPE_SECRET_KEY_TEST || env.STRIPE_SECRET_KEY) : env.STRIPE_SECRET_KEY;
+  const chargeResponse = await fetch(
+    `https://api.stripe.com/v1/charges/${chargeId}`,
+    { headers: { 'Authorization': `Bearer ${stripeKey}` } }
+  );
+  if (!chargeResponse.ok) {
+    console.error(`[CHARGEBACK_ERROR] Failed to look up charge=${chargeId}`);
+    return jsonResponse({ error: 'Failed to look up charge' }, 500, origin);
+  }
+  const charge = await chargeResponse.json();
+  const paymentIntentId = charge.payment_intent;
+
+  const sessionsResponse = await fetch(
+    `https://api.stripe.com/v1/checkout/sessions?payment_intent=${paymentIntentId}&limit=1`,
+    { headers: { 'Authorization': `Bearer ${stripeKey}` } }
+  );
+  if (!sessionsResponse.ok) {
+    console.error(`[CHARGEBACK_ERROR] Failed to look up session for payment_intent=${paymentIntentId}`);
+    return jsonResponse({ error: 'Failed to look up original session' }, 500, origin);
+  }
+  const sessions = await sessionsResponse.json();
+  const sessionId = sessions.data?.[0]?.id;
+  if (!sessionId) {
+    console.error(`[CHARGEBACK_ERROR] No session found for payment_intent=${paymentIntentId}`);
+    return jsonResponse({ error: 'Original session not found' }, 500, origin);
+  }
+
+  const purchaseTransaction = await env.DB.prepare(
+    'SELECT license_key FROM credit_transactions WHERE order_id = ? AND reason LIKE \'purchase:%\''
+  ).bind(sessionId).first();
+  if (!purchaseTransaction) {
+    console.error(`[CHARGEBACK_ERROR] No purchase transaction found for session=${sessionId}`);
+    return jsonResponse({ error: 'Original purchase not found' }, 500, origin);
+  }
+
+  const licenseKey = purchaseTransaction.license_key;
+  const license = await env.DB.prepare(
+    'SELECT credits_remaining, product FROM licenses WHERE license_key = ?'
+  ).bind(licenseKey).first();
+  if (!license) {
+    console.error(`[CHARGEBACK_ERROR] License not found for key=${licenseKey}`);
+    return jsonResponse({ error: 'License not found' }, 500, origin);
+  }
+
+  const creditsRevoked = license.credits_remaining;
+
+  // Revoke immediately — zero out credits, set status to revoked
+  await env.DB.prepare(
+    'UPDATE licenses SET credits_remaining = 0, status = \'revoked\', updated_at = datetime(\'now\') WHERE license_key = ?'
+  ).bind(licenseKey).run();
+
+  await env.DB.prepare(
+    'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
+  ).bind(licenseKey, -creditsRevoked, `chargeback:${disputeId}`, disputeId).run();
+
+  // Log chargeback as negative sale
+  const productName = PRODUCT_DISPLAY_NAMES[license.product] || license.product;
+  try {
+    await fetch(env.GOOGLE_SHEETS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        date: new Date().toISOString().substring(0, 10),
+        order_id: disputeId,
+        product: productName,
+        variant: 'Chargeback',
+        amount: -disputeAmount,
+        email: '',
+        test_mode: testMode ? 'Yes' : 'No',
+        country: '',
+      }),
+      redirect: 'follow',
+    });
+  } catch (e) {
+    console.error(`[SHEETS_ERROR] Failed to log chargeback | dispute=${disputeId}`, e.message || e);
+  }
+
+  // Log Stripe dispute fee (EUR 15) as expense
+  try {
+    const feeParams = new URLSearchParams({
+      action: 'addExpense',
+      date: new Date().toISOString().substring(0, 10),
+      supplier: 'Stripe',
+      description: `Chargeback dispute fee (${disputeId})`,
+      category: 'Fees',
+      amount: '15',
+      key: env.GOOGLE_SHEETS_API_KEY,
+    });
+    await fetch(`${env.GOOGLE_SHEETS_URL}?${feeParams}`, { redirect: 'follow' });
+  } catch (e) {
+    console.error(`[SHEETS_ERROR] Failed to log dispute fee | dispute=${disputeId}`, e.message || e);
+  }
+
+  console.error(`[CHARGEBACK] License revoked | dispute=${disputeId} charge=${chargeId} license=${licenseKey} credits_revoked=${creditsRevoked}`);
+  return jsonResponse({ ok: true, license_key: licenseKey, credits_revoked: creditsRevoked, status: 'revoked' }, 200, origin);
+}
+
+// ──────────────────────────────────────────────
+// Dispute closed handler: reinstate if won
+// ──────────────────────────────────────────────
+async function handleDisputeClosed(event, env, origin) {
+  const dispute = event.data.object;
+  const disputeId = dispute.id;
+  const disputeStatus = dispute.status; // 'won' or 'lost'
+
+  if (disputeStatus !== 'won') {
+    console.log(`[CHARGEBACK] Dispute lost | dispute=${disputeId}`);
+    return jsonResponse({ ok: true, dispute_status: disputeStatus }, 200, origin);
+  }
+
+  // Dispute won — reinstate the license
+  const chargebackTransaction = await env.DB.prepare(
+    'SELECT license_key, change FROM credit_transactions WHERE order_id = ? AND reason LIKE \'chargeback:%\''
+  ).bind(disputeId).first();
+  if (!chargebackTransaction) {
+    console.error(`[CHARGEBACK_ERROR] No chargeback transaction found for dispute=${disputeId}`);
+    return jsonResponse({ error: 'Chargeback transaction not found' }, 500, origin);
+  }
+
+  const licenseKey = chargebackTransaction.license_key;
+  const creditsToRestore = Math.abs(chargebackTransaction.change);
+
+  // Idempotency: check if reversal already processed
+  const existingReversal = await env.DB.prepare(
+    'SELECT id FROM credit_transactions WHERE order_id = ? AND reason LIKE \'chargeback_reversed:%\''
+  ).bind(disputeId).first();
+  if (existingReversal) {
+    return jsonResponse({ ok: true, already_processed: true }, 200, origin);
+  }
+
+  await env.DB.prepare(
+    'UPDATE licenses SET credits_remaining = credits_remaining + ?, status = \'active\', updated_at = datetime(\'now\') WHERE license_key = ?'
+  ).bind(creditsToRestore, licenseKey).run();
+
+  await env.DB.prepare(
+    'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
+  ).bind(licenseKey, creditsToRestore, `chargeback_reversed:${disputeId}`, disputeId).run();
+
+  console.log(`[CHARGEBACK] Dispute won, license reinstated | dispute=${disputeId} license=${licenseKey} credits_restored=${creditsToRestore}`);
+  return jsonResponse({ ok: true, license_key: licenseKey, credits_restored: creditsToRestore, status: 'active' }, 200, origin);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -195,6 +450,20 @@ export default {
 
         const event = JSON.parse(rawBody);
 
+        // ── Handle refunds ──
+        if (event.type === 'charge.refunded') {
+          return await handleRefund(event, env, origin);
+        }
+
+        // ── Handle chargebacks ──
+        if (event.type === 'charge.dispute.created') {
+          return await handleDisputeCreated(event, env, origin);
+        }
+
+        if (event.type === 'charge.dispute.closed') {
+          return await handleDisputeClosed(event, env, origin);
+        }
+
         if (event.type !== 'checkout.session.completed') {
           return jsonResponse({ ok: true, skipped: true }, 200, origin);
         }
@@ -239,16 +508,18 @@ export default {
 
         // Check if license already exists for this email+product
         const existingLicense = await env.DB.prepare(
-          'SELECT license_key, credits_remaining FROM licenses WHERE email = ? AND product = ?'
+          'SELECT license_key, credits_remaining, status FROM licenses WHERE email = ? AND product = ?'
         ).bind(email, product).first();
 
         let licenseKey;
 
         if (existingLicense) {
           licenseKey = existingLicense.license_key;
+          // Reactivate suspended licenses on new purchase (but not revoked — chargebacks stay revoked)
+          const newStatus = existingLicense.status === 'suspended' ? 'active' : existingLicense.status;
           await env.DB.prepare(
-            'UPDATE licenses SET credits_remaining = credits_remaining + ?, updated_at = datetime(\'now\') WHERE license_key = ?'
-          ).bind(credits, licenseKey).run();
+            'UPDATE licenses SET credits_remaining = credits_remaining + ?, status = ?, updated_at = datetime(\'now\') WHERE license_key = ?'
+          ).bind(credits, newStatus, licenseKey).run();
         } else {
           licenseKey = crypto.randomUUID().toUpperCase();
           await env.DB.prepare(
@@ -361,7 +632,7 @@ export default {
         return jsonResponse({ error: 'not_found' }, 404, origin);
       }
       const license = await env.DB.prepare(
-        'SELECT license_key, credits_remaining, product FROM licenses WHERE license_key = ?'
+        'SELECT license_key, credits_remaining, product, status FROM licenses WHERE license_key = ?'
       ).bind(transaction.license_key).first();
       return jsonResponse(license || { error: 'not_found' }, license ? 200 : 404, origin);
     }
@@ -377,7 +648,7 @@ export default {
       }
 
       const license = await env.DB.prepare(
-        'SELECT credits_remaining, product FROM licenses WHERE license_key = ?'
+        'SELECT credits_remaining, product, status FROM licenses WHERE license_key = ?'
       ).bind(licenseKey).first();
 
       if (!license) {
@@ -387,6 +658,7 @@ export default {
       return jsonResponse({
         credits_remaining: license.credits_remaining,
         product: license.product,
+        status: license.status,
       }, 200, origin);
     }
 
@@ -416,11 +688,15 @@ export default {
         // Check license validity and product match
         const expectedProduct = PRODUCT_FOR_TYPE[type];
         const license = await env.DB.prepare(
-          'SELECT credits_remaining, product FROM licenses WHERE license_key = ?'
+          'SELECT credits_remaining, product, status FROM licenses WHERE license_key = ?'
         ).bind(license_key).first();
 
         if (!license) {
           return jsonResponse({ error: 'invalid_key', message: 'Invalid license key.' }, 401, origin);
+        }
+
+        if (license.status !== 'active') {
+          return jsonResponse({ error: 'license_suspended', message: 'This license has been suspended.' }, 403, origin);
         }
 
         if (license.product !== expectedProduct) {
