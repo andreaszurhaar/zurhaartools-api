@@ -777,8 +777,13 @@ export default {
         // Parse the JSON response from Claude
         let parsed;
         try {
-          const cleaned = content.replace(/^```(?:json)?\n?/g, '').replace(/\n?```$/g, '').trim();
-          parsed = JSON.parse(cleaned);
+          let text = content.trim();
+          // Strip markdown code fences if present
+          const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+          if (fenceMatch) {
+            text = fenceMatch[1].trim();
+          }
+          parsed = JSON.parse(text);
         } catch {
           try {
             const jsonMatch = content.match(/\{[\s\S]*\}/);
