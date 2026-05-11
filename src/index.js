@@ -65,40 +65,51 @@ Only respond with valid JSON, no other text.
 Job posting to analyze:
 `,
 
-  'tos-scan': `You are a consumer rights expert. Analyze the following Terms of Service or Privacy Policy and identify clauses that are concerning for the user.
+  'tos-scan': `You are a consumer rights expert. Analyze the following Terms of Service or Privacy Policy and identify red flags and green flags for the user.
 
-For each concerning clause, provide:
-- The relevant text (summarized if very long)
-- What it means in plain language
+For each red flag found, provide:
+- The exact text from the document (summarized if very long)
+- What it means in plain language for the user
 - A severity level: "high", "medium", or "low"
 
-Also provide an overall privacy/fairness score from 1-10 (1 = very concerning, 10 = very fair) and a one-sentence summary.
+Also provide an overall fairness score from 1-10 (1 = many red flags, 10 = very fair) and a one-paragraph plain-language summary of the terms.
 
-Look for:
-- Data selling or sharing with third parties
-- Irrevocable content licenses
-- Unilateral terms changes without notice
-- Liability limitations
-- Forced arbitration
-- Auto-renewal traps
-- Data retention policies
-- Right to terminate without reason
+Red flags to look for:
+- Data sharing with third parties or selling user data
+- Broad license to user content (IP rights grab)
+- Liability waivers or limitation of damages
+- Unilateral right to change terms without notice
+- Auto-renewal or difficult cancellation
+- Binding arbitration or class action waiver
+- Jurisdiction in unfavorable locations
+- Broad data retention or vague deletion policy
+- Broad indemnification clauses
+
+Green flags to look for:
+- Clear data deletion or right to erasure
+- No data selling
+- Transparent data practices
+- Easy cancellation
+- Money-back guarantee or refund policy
+- Clear contact information
+- GDPR or privacy law compliance
+- Open source components disclosed
 
 Respond in JSON format:
 {
   "score": number,
   "summary": "string",
-  "concerns": [
+  "redFlags": [
     {
-      "text": "relevant clause text",
-      "meaning": "what this means for you",
+      "text": "exact quote from document",
+      "meaning": "what this means for the user",
       "severity": "high|medium|low"
     }
   ],
-  "positives": [
+  "greenFlags": [
     {
-      "text": "relevant clause text",
-      "meaning": "why this is good"
+      "text": "exact quote from document",
+      "meaning": "why this is good for the user"
     }
   ]
 }
