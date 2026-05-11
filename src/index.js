@@ -20,6 +20,10 @@ const STRIPE_PRICES = {
   'price_1TQoOk2OmqjfvJPqDzWnbzWZ': { credits: 50, product: 'job-red-flag-detector', variant: '50 Scans' },
   'price_1TQoOk2OmqjfvJPq844bFp1N': { credits: 150, product: 'job-red-flag-detector', variant: '150 Scans' },
   'price_1TQoOk2OmqjfvJPqB8j6OW4J': { credits: 500, product: 'job-red-flag-detector', variant: '500 Scans' },
+  // ToS Scanner — Live prices
+  'price_1TVsfi2OmqjfvJPqm3IFIWzF': { credits: 50, product: 'tos-scanner', variant: '50 Scans' },
+  'price_1TVsfj2OmqjfvJPqZG5iOqev': { credits: 150, product: 'tos-scanner', variant: '150 Scans' },
+  'price_1TVsfk2OmqjfvJPqY6AVUXb1': { credits: 500, product: 'tos-scanner', variant: '500 Scans' },
 };
 
 const PROMPTS = {
