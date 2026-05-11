@@ -597,7 +597,7 @@ export default {
   <p><strong>Credits:</strong> ${totalCredits} scans available</p>
   <h3>How to use</h3>
   <ol>
-    <li>Install the ${productName} browser extension</li>
+    <li>Install the extension: <a href="https://chromewebstore.google.com/detail/job-red-flag-detector/opcklnckbijmdlmdjgmhdnkclkehemni" style="color: #fb923c;">Chrome</a> or <a href="https://microsoftedge.microsoft.com/addons/detail/job-red-flag-detector/nnppdamkeahgdhcgjcfijjeapcijngpk" style="color: #fb923c;">Edge</a></li>
     <li>Open the extension and paste your license key</li>
     <li>Start scanning</li>
   </ol>
