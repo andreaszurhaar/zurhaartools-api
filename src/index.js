@@ -807,6 +807,97 @@ export default {
     }
 
     // ──────────────────────────────────────────────
+    // License key recovery: resends license key(s) to email
+    // ──────────────────────────────────────────────
+    if (url.pathname === '/api/recover' && request.method === 'POST') {
+      const genericResponse = { ok: true, message: 'If an account exists with this email, a recovery email has been sent.' };
+
+      try {
+        const body = await request.json();
+        const { email } = body;
+
+        if (!email) {
+          return jsonResponse({ error: 'Missing email field' }, 400, origin);
+        }
+
+        // Find all active licenses for this email
+        const licenses = await env.DB.prepare(
+          'SELECT license_key, product, credits_remaining, last_recovery_at FROM licenses WHERE email = ? AND status = \'active\''
+        ).bind(email).all();
+
+        if (!licenses.results || licenses.results.length === 0) {
+          return jsonResponse(genericResponse, 200, origin);
+        }
+
+        // Rate limit: check if any license had a recovery email in the last 5 minutes
+        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+        const recentRecovery = licenses.results.some(
+          l => l.last_recovery_at && l.last_recovery_at > fiveMinutesAgo
+        );
+        if (recentRecovery) {
+          console.log(`[RECOVERY] Rate limited | email=${email}`);
+          return jsonResponse(genericResponse, 200, origin);
+        }
+
+        // Build license list HTML
+        const licenseListHtml = licenses.results.map(l => {
+          const displayName = PRODUCT_DISPLAY_NAMES[l.product] || l.product;
+          return `<div style="background: #12121a; border: 1px solid #2e2e42; border-radius: 8px; padding: 16px; margin: 12px 0;">
+    <p style="margin: 0 0 8px 0; color: #e2e8f0;"><strong>${displayName}</strong></p>
+    <code style="color: #fb923c; font-size: 16px; word-break: break-all;">${l.license_key}</code>
+    <p style="margin: 8px 0 0 0; color: #94a3b8; font-size: 14px;">${l.credits_remaining} scans remaining</p>
+  </div>`;
+        }).join('');
+
+        // Send recovery email
+        try {
+          await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              from: 'Zurhaar Tools <andreas@zurhaartools.com>',
+              to: email,
+              subject: 'License Key Recovery — Zurhaar Tools',
+              html: `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+  <h2 style="color: #f97316;">Your license keys</h2>
+  <p>Here are the license keys associated with your email:</p>
+  ${licenseListHtml}
+  <h3>How to use</h3>
+  <ol>
+    <li>Install the extension: <a href="https://chromewebstore.google.com/detail/job-red-flag-detector/opcklnckbijmdlmdjgmhdnkclkehemni" style="color: #fb923c;">Chrome</a> or <a href="https://microsoftedge.microsoft.com/addons/detail/job-red-flag-detector/nnppdamkeahgdhcgjcfijjeapcijngpk" style="color: #fb923c;">Edge</a></li>
+    <li>Open the extension and paste your license key</li>
+    <li>Start scanning</li>
+  </ol>
+  <p style="color: #94a3b8; font-size: 14px; margin-top: 30px;">Need help? Reply to this email or contact <a href="mailto:andreas@zurhaartools.com" style="color: #fb923c;">andreas@zurhaartools.com</a></p>
+  <p style="color: #94a3b8; font-size: 12px;">Zurhaar Tools — <a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a></p>
+</div>`,
+            }),
+          });
+        } catch (e) {
+          console.error(`[RECOVERY_ERROR] Failed to send recovery email | email=${email}`, e.message || e);
+          return jsonResponse(genericResponse, 200, origin);
+        }
+
+        // Update last_recovery_at for all licenses
+        const now = new Date().toISOString();
+        for (const l of licenses.results) {
+          await env.DB.prepare(
+            'UPDATE licenses SET last_recovery_at = ? WHERE license_key = ?'
+          ).bind(now, l.license_key).run();
+        }
+
+        console.log(`[RECOVERY] Recovery email sent | email=${email} licenses=${licenses.results.length}`);
+        return jsonResponse(genericResponse, 200, origin);
+      } catch (err) {
+        console.error(`[RECOVERY_ERROR] Recovery failed`, err.message || err);
+        return jsonResponse(genericResponse, 200, origin);
+      }
+    }
+
+    // ──────────────────────────────────────────────
     // Admin: GDPR customer data deletion (anonymization)
     // ──────────────────────────────────────────────
     if (url.pathname === '/api/admin/delete-customer' && request.method === 'POST') {

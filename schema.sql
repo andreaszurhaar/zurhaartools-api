@@ -5,6 +5,7 @@ CREATE TABLE licenses (
   email TEXT NOT NULL,
   credits_remaining INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'active',
+  last_recovery_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

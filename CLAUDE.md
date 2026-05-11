@@ -40,11 +40,12 @@ wrangler.toml             ← Worker config (D1 binding, CORS origins)
 - `/api/scan` — AI scanning endpoint (validates license, deducts credit, calls Claude)
 - `/api/credits` — returns remaining credits for a license key
 - `/api/license` — looks up license by Stripe session ID (for success page)
+- `/api/recover` — license key recovery (resends keys to email, 5-min rate limit, uniform response to prevent enumeration)
 - `/api/admin/delete-customer` — GDPR data deletion (anonymizes customer across D1, requires ADMIN_API_KEY)
 
 ## Database schema
 ```sql
-licenses (id, license_key, product, email, credits_remaining, status, created_at, updated_at)
+licenses (id, license_key, product, email, credits_remaining, status, last_recovery_at, created_at, updated_at)
 credit_transactions (id, license_key, change, reason, order_id, created_at)
 ```
 
