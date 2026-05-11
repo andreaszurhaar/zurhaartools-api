@@ -16,10 +16,14 @@ const STRIPE_PRICES = {
   'price_1TQmUD2OmqjfvJPqWpjGA7PV': { credits: 50, product: 'job-red-flag-detector', variant: '50 Scans' },
   'price_1TQmUE2OmqjfvJPqNVYjk4JV': { credits: 150, product: 'job-red-flag-detector', variant: '150 Scans' },
   'price_1TQmUE2OmqjfvJPqUXdldl3e': { credits: 500, product: 'job-red-flag-detector', variant: '500 Scans' },
-  // Live prices
+  // Job Red Flag Detector — Live prices (old, keep for in-flight purchases)
   'price_1TQoOk2OmqjfvJPqDzWnbzWZ': { credits: 50, product: 'job-red-flag-detector', variant: '50 Scans' },
   'price_1TQoOk2OmqjfvJPq844bFp1N': { credits: 150, product: 'job-red-flag-detector', variant: '150 Scans' },
   'price_1TQoOk2OmqjfvJPqB8j6OW4J': { credits: 500, product: 'job-red-flag-detector', variant: '500 Scans' },
+  // Job Red Flag Detector — Live prices (new, single product)
+  'price_1TVssD2OmqjfvJPqRaROgekv': { credits: 50, product: 'job-red-flag-detector', variant: '50 Scans' },
+  'price_1TVssE2OmqjfvJPq7M4Id0Vd': { credits: 150, product: 'job-red-flag-detector', variant: '150 Scans' },
+  'price_1TVssF2OmqjfvJPqcH8wgnqO': { credits: 500, product: 'job-red-flag-detector', variant: '500 Scans' },
   // ToS Scanner — Live prices
   'price_1TVsfi2OmqjfvJPqm3IFIWzF': { credits: 50, product: 'tos-scanner', variant: '50 Scans' },
   'price_1TVsfj2OmqjfvJPqZG5iOqev': { credits: 150, product: 'tos-scanner', variant: '150 Scans' },
