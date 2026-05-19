@@ -495,6 +495,36 @@ export default {
         const country = session.customer_details?.address?.country || '';
         const testMode = event.livemode === false;
 
+        // Extract withdrawal-right waiver acknowledgement from the Stripe
+        // Payment Link custom field (configured in Stripe Dashboard).
+        // Stripe Payment Links currently support dropdown/numeric/text custom
+        // field types (no checkbox). We use a required dropdown with a single
+        // 'agree' option; selecting it constitutes the express opt-in.
+        // We still accept a checkbox shape defensively in case Stripe adds it.
+        let waiverAcknowledgedAt = null;
+        let waiverText = null;
+        const customFields = Array.isArray(session.custom_fields) ? session.custom_fields : [];
+        const waiverField = customFields.find(f => (f?.key || '').toLowerCase().startsWith('waiver'));
+        if (waiverField) {
+          const isCheckedCheckbox = waiverField.type === 'checkbox' && waiverField.checkbox?.value === 'checked';
+          const dropdownValue = waiverField.dropdown?.value;
+          const isAgreedDropdown = waiverField.type === 'dropdown' && typeof dropdownValue === 'string' && dropdownValue.length > 0;
+          if (isCheckedCheckbox || isAgreedDropdown) {
+            waiverAcknowledgedAt = new Date().toISOString();
+            const fieldLabel = waiverField.label?.custom || '';
+            if (isAgreedDropdown) {
+              const selectedOption = (waiverField.dropdown?.options || []).find(o => o?.value === dropdownValue);
+              const optionLabel = selectedOption?.label || '';
+              waiverText = [fieldLabel, optionLabel].filter(Boolean).join(' — ') || null;
+            } else {
+              waiverText = fieldLabel || null;
+            }
+          }
+        }
+        if (!waiverAcknowledgedAt) {
+          console.warn(`[WAIVER_MISSING] No waiver acknowledgement on session=${sessionId}. Configure waiver custom field on the Payment Link in Stripe Dashboard.`);
+        }
+
         // Get line items to determine which price was purchased
         const stripeKey = testMode ? (env.STRIPE_SECRET_KEY_TEST || env.STRIPE_SECRET_KEY) : env.STRIPE_SECRET_KEY;
         const lineItemsResponse = await fetch(
@@ -536,14 +566,17 @@ export default {
           licenseKey = existingLicense.license_key;
           // Reactivate suspended licenses on new purchase (but not revoked — chargebacks stay revoked)
           const newStatus = existingLicense.status === 'suspended' ? 'active' : existingLicense.status;
+          // Persist the latest waiver acknowledgement on top-up, only when present
+          // (the consumer ticked the box on this purchase). COALESCE preserves the
+          // most recent prior waiver if this session lacked one.
           await env.DB.prepare(
-            'UPDATE licenses SET credits_remaining = credits_remaining + ?, status = ?, updated_at = datetime(\'now\') WHERE license_key = ?'
-          ).bind(credits, newStatus, licenseKey).run();
+            'UPDATE licenses SET credits_remaining = credits_remaining + ?, status = ?, waiver_acknowledged_at = COALESCE(?, waiver_acknowledged_at), waiver_text = COALESCE(?, waiver_text), updated_at = datetime(\'now\') WHERE license_key = ?'
+          ).bind(credits, newStatus, waiverAcknowledgedAt, waiverText, licenseKey).run();
         } else {
           licenseKey = crypto.randomUUID().toUpperCase();
           await env.DB.prepare(
-            'INSERT INTO licenses (license_key, product, email, credits_remaining) VALUES (?, ?, ?, ?)'
-          ).bind(licenseKey, product, email, credits).run();
+            'INSERT INTO licenses (license_key, product, email, credits_remaining, waiver_acknowledged_at, waiver_text) VALUES (?, ?, ?, ?, ?, ?)'
+          ).bind(licenseKey, product, email, credits, waiverAcknowledgedAt, waiverText).run();
         }
 
         // Record transaction
@@ -596,6 +629,18 @@ export default {
         const totalCredits = existingLicense
           ? existingLicense.credits_remaining + credits
           : credits;
+        // Echo the withdrawal-right waiver back to the consumer (art. 6:230v lid 7 BW).
+        // Use the exact text the consumer agreed to. If no waiver was captured
+        // (Payment Link not yet configured with the checkbox), omit the section.
+        const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const waiverSection = waiverText
+          ? `<div style="background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; padding: 16px; margin: 0 0 20px 0; color: #1f2937; font-size: 14px;">
+    <p style="margin: 0 0 8px 0; font-weight: 600; color: #c2410c;">Belangrijke informatie over uw herroepingsrecht</p>
+    <p style="margin: 0 0 8px 0;">U heeft bij het bestellen ingestemd met de directe levering en daarmee uitdrukkelijk verklaard afstand te doen van uw 14-daagse herroepingsrecht. De volgende verklaring heeft u geaccepteerd:</p>
+    <p style="margin: 0 0 8px 0; font-style: italic;">&ldquo;${escapeHtml(waiverText)}&rdquo;</p>
+    <p style="margin: 0;">Bij vragen over uw bestelling kunt u contact opnemen via <a href="mailto:support@zurhaartools.com" style="color: #c2410c;">support@zurhaartools.com</a>.</p>
+  </div>`
+          : '';
         try {
           await fetch('https://api.resend.com/emails', {
             method: 'POST',
@@ -608,6 +653,7 @@ export default {
               to: email,
               subject: `Your license key — ${productName} ${variant}`,
               html: `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+  ${waiverSection}
   <h2 style="color: #f97316;">Thanks for your purchase!</h2>
   <p>Here is your license key for the <strong>${productName}</strong>:</p>
   <div style="background: #12121a; border: 1px solid #2e2e42; border-radius: 8px; padding: 16px; margin: 20px 0;">
@@ -756,7 +802,7 @@ export default {
             },
             body: JSON.stringify({
               model: 'claude-haiku-4-5-20251001',
-              max_tokens: 2048,
+              max_tokens: 4096,
               messages: [
                 {
                   role: 'user',
