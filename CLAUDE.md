@@ -70,18 +70,50 @@ wrangler deploy
 ```
 
 ## When adding a new product
-1. Create Stripe product + price via API or dashboard
-2. Add the price ID to `STRIPE_PRICES` mapping:
-   ```javascript
-   'price_XXX': { credits: 50, product: 'new-product', variant: '50 Scans' },
-   ```
-3. Add the scan type to `PRODUCT_FOR_TYPE`:
-   ```javascript
-   'new-scan-type': 'new-product',
-   ```
-4. Add the AI prompt to `PROMPTS` for the new scan type
-5. Run `wrangler deploy`
-6. Create Stripe payment links and share URLs with the Website agent
+
+Follow these steps exactly. Use the existing Job Red Flag Detector entries as the template.
+
+### Step 1: Add product display name to `PRODUCT_DISPLAY_NAMES`
+```javascript
+'new-product': 'New Product Name',
+```
+
+### Step 2: Add scan type to `PRODUCT_FOR_TYPE`
+```javascript
+'new-scan-type': 'new-product',
+```
+
+### Step 3: Add AI prompt to `PROMPTS`
+```javascript
+'new-scan-type': `Your prompt here...`,
+```
+Copy the structure from the existing `job-red-flags` prompt — JSON output format with score, red/green flags, severity levels, and summary.
+
+### Step 4: Create Stripe products, prices, and payment links
+Use the Stripe API or dashboard to create:
+- 1 product (e.g. "New Product - Scans")
+- 3 prices: 50 scans (€1.99), 150 scans (€4.99), 500 scans (€9.99)
+- 3 payment links with redirect to `https://zurhaartools.com/success?session_id={CHECKOUT_SESSION_ID}`
+
+### Step 5: Add price mapping to `STRIPE_PRICES`
+```javascript
+'price_XXX': { credits: 50, product: 'new-product', variant: '50 Scans' },
+'price_YYY': { credits: 150, product: 'new-product', variant: '150 Scans' },
+'price_ZZZ': { credits: 500, product: 'new-product', variant: '500 Scans' },
+```
+
+### Step 6: Update email template store links
+The purchase and recovery emails currently hardcode Chrome/Edge links for Job Red Flag Detector. When adding product #2, make the store links dynamic — map product names to store URLs.
+
+### Step 7: Deploy
+```bash
+wrangler deploy
+```
+
+### Step 8: Share with other agents
+- Give payment link URLs to the Website agent (for pricing page)
+- Give store URLs to the Website agent (after Chrome/Edge approval)
+- Confirm scan type name with the Extensions agent (must match what the extension sends)
 
 ## Stripe webhook flow
 ```
