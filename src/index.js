@@ -10,6 +10,43 @@ const PRODUCT_DISPLAY_NAMES = {
   'tos-scanner': 'ToS Scanner',
 };
 
+// Chrome Web Store + Edge Add-ons URLs per product.
+// Used by purchase + recovery email templates to send customers to the right
+// install page. Falls back to https://zurhaartools.com if a product has no
+// links yet (extension still in review).
+const STORE_LINKS = {
+  'job-red-flag-detector': {
+    chrome: 'https://chromewebstore.google.com/detail/job-red-flag-detector/opcklnckbijmdlmdjgmhdnkclkehemni',
+    edge: 'https://microsoftedge.microsoft.com/addons/detail/job-red-flag-detector/nnppdamkeahgdhcgjcfijjeapcijngpk',
+  },
+  'tos-scanner': {
+    // TODO(andreas): fill in once Andreas confirms the published URLs.
+    // Chrome: format is https://chromewebstore.google.com/detail/tos-scanner/<extension-id>
+    //   — get the ID from the Chrome Web Store Developer Dashboard listing.
+    // Edge: format is https://microsoftedge.microsoft.com/addons/detail/tos-scanner/<extension-id>
+    //   — Edge approval still pending as of May 21, 2026.
+    chrome: null,
+    edge: null,
+  },
+};
+
+// Renders the "Install the extension: Chrome or Edge" line for a product.
+// If links are not yet available, falls back to a generic zurhaartools.com link
+// so the email still makes sense before the store listings go live.
+function renderStoreLinks(product) {
+  const links = STORE_LINKS[product];
+  if (links && links.chrome && links.edge) {
+    return `<a href="${links.chrome}" style="color: #fb923c;">Chrome</a> or <a href="${links.edge}" style="color: #fb923c;">Edge</a>`;
+  }
+  if (links && links.chrome) {
+    return `<a href="${links.chrome}" style="color: #fb923c;">Chrome Web Store</a>`;
+  }
+  if (links && links.edge) {
+    return `<a href="${links.edge}" style="color: #fb923c;">Edge Add-ons</a>`;
+  }
+  return `<a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a>`;
+}
+
 // Maps Stripe price IDs to credit amounts and product info
 const STRIPE_PRICES = {
   // Test prices
@@ -127,6 +164,304 @@ Only respond with valid JSON, no other text.
 Text to analyze:
 `,
 };
+
+// ──────────────────────────────────────────────
+// Chrome Extension Kit (Gumroad → GitHub) constants
+// ──────────────────────────────────────────────
+// Hard-coded per V9 brief: the kit only ships from one repo. If we ever sell
+// multiple kit repos, store these on the kit_purchases row at sale time.
+const KIT_REPO_OWNER = 'andreaszurhaar';
+const KIT_REPO_NAME = 'chrome-extension-kit-template';
+const KIT_GITHUB_UA = 'zurhaartools-kit-invite/1.0';
+
+// Map Gumroad product_permalink → kit tier. Add new permalinks as we publish
+// additional tiers on Gumroad. Falls back to null (recorded as-is).
+const KIT_TIER_FOR_PERMALINK = {
+  'chrome-extension-kit-starter': 'starter',
+  'chrome-extension-kit-pro': 'pro',
+  'chrome-extension-kit-studio': 'studio',
+  // Fallback permalink if Andreas configures a single product with variants:
+  'chrome-extension-kit': 'starter',
+};
+
+// GitHub username rules: 1–39 chars, alphanumeric + single hyphens, can't
+// start/end with hyphen. See docs.github.com/en/admin/identity-and-access-management.
+const GITHUB_USERNAME_REGEX = /^[a-z\d](?:[a-z\d]|-(?=[a-z\d])){0,38}$/;
+
+function normalizeGithubUsername(raw) {
+  if (typeof raw !== 'string') return null;
+  let u = raw.trim().toLowerCase();
+  if (!u) return null;
+  // Strip leading @
+  if (u.startsWith('@')) u = u.slice(1);
+  // Strip github URL prefixes (with or without protocol)
+  u = u.replace(/^https?:\/\/(?:www\.)?github\.com\//, '');
+  u = u.replace(/^github\.com\//, '');
+  // Strip trailing slash / path segments (e.g. someone pastes a repo URL)
+  u = u.split('/')[0];
+  if (!GITHUB_USERNAME_REGEX.test(u)) return null;
+  return u;
+}
+
+// Parses Gumroad's form-encoded Ping body. Gumroad serialises custom checkout
+// fields as bracket keys, e.g. `custom_fields[GitHub username]=octocat`.
+// URLSearchParams handles the bracket keys as opaque key strings, which is
+// what we want. Returns a Map<string, string> (first value wins on duplicates).
+function parseFormBody(raw) {
+  const params = new URLSearchParams(raw);
+  const out = {};
+  for (const [k, v] of params.entries()) {
+    if (!(k in out)) out[k] = v;
+  }
+  return out;
+}
+
+// Extracts the GitHub username from a parsed Gumroad form payload.
+// Gumroad allows the seller to label the custom field; we try the common
+// labels (`GitHub username`, `Github Username`, etc.) and fall back to a
+// case-insensitive scan over `custom_fields[*]` keys.
+function extractGithubUsernameFromForm(form) {
+  const candidates = [
+    'custom_fields[GitHub username]',
+    'custom_fields[Github Username]',
+    'custom_fields[github username]',
+    'custom_fields[GitHub Username]',
+    'custom_fields[github_username]',
+  ];
+  for (const key of candidates) {
+    if (form[key]) return form[key];
+  }
+  // Case-insensitive scan for any custom_fields[*] containing "github"
+  for (const key of Object.keys(form)) {
+    const m = key.match(/^custom_fields\[(.+)\]$/);
+    if (m && /github/i.test(m[1])) return form[key];
+  }
+  return null;
+}
+
+// ──────────────────────────────────────────────
+// GitHub API helpers (collaborator management)
+// ──────────────────────────────────────────────
+// addCollaborator: PUT /repos/{owner}/{repo}/collaborators/{username}
+// Returns one of:
+//   { status: 'invited', invite_id: number }    — 201, invitation created
+//   { status: 'already_active' }                — 204, already a collaborator
+//   { status: 'bad_username' }                  — 404, GitHub user does not exist
+//   { status: 'blocked', detail: string }       — 422, spam/validation flag
+//   { status: 'error', http_status, detail }    — other failures (caller decides)
+async function addCollaborator(username, env) {
+  if (!env.GITHUB_KIT_PAT) {
+    return { status: 'error', http_status: 0, detail: 'GITHUB_KIT_PAT not configured' };
+  }
+  const url = `https://api.github.com/repos/${KIT_REPO_OWNER}/${KIT_REPO_NAME}/collaborators/${encodeURIComponent(username)}`;
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${env.GITHUB_KIT_PAT}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': KIT_GITHUB_UA,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ permission: 'pull' }),
+    });
+  } catch (e) {
+    return { status: 'error', http_status: 0, detail: e.message || String(e) };
+  }
+
+  if (resp.status === 201) {
+    let invite_id = null;
+    try {
+      const body = await resp.json();
+      invite_id = typeof body?.id === 'number' ? body.id : null;
+    } catch { /* body may be empty under rare conditions */ }
+    return { status: 'invited', invite_id, http_status: 201 };
+  }
+  if (resp.status === 204) {
+    return { status: 'already_active', http_status: 204 };
+  }
+  if (resp.status === 404) {
+    return { status: 'bad_username', http_status: 404 };
+  }
+  if (resp.status === 422) {
+    const detail = await resp.text().catch(() => '');
+    return { status: 'blocked', http_status: 422, detail };
+  }
+  const detail = await resp.text().catch(() => '');
+  return { status: 'error', http_status: resp.status, detail };
+}
+
+// removeCollaborator: DELETE /repos/{owner}/{repo}/collaborators/{username}
+// Idempotent — 204 (removed) and 404 (not a collaborator) are both fine.
+async function removeCollaborator(username, env) {
+  if (!env.GITHUB_KIT_PAT) {
+    return { status: 'error', http_status: 0, detail: 'GITHUB_KIT_PAT not configured' };
+  }
+  const url = `https://api.github.com/repos/${KIT_REPO_OWNER}/${KIT_REPO_NAME}/collaborators/${encodeURIComponent(username)}`;
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${env.GITHUB_KIT_PAT}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': KIT_GITHUB_UA,
+      },
+    });
+  } catch (e) {
+    return { status: 'error', http_status: 0, detail: e.message || String(e) };
+  }
+  if (resp.status === 204 || resp.status === 404) {
+    return { status: 'removed', http_status: resp.status };
+  }
+  const detail = await resp.text().catch(() => '');
+  return { status: 'error', http_status: resp.status, detail };
+}
+
+// ──────────────────────────────────────────────
+// Kit email templates (Resend)
+// ──────────────────────────────────────────────
+// Welcome email sent after a successful Gumroad sale + GitHub invite.
+// `inviteOutcome` is the result of addCollaborator() so the copy can adapt to
+// already-active vs. bad-username vs. happy-path.
+function renderKitPurchaseEmail({ email, githubUsername, tier, inviteOutcome }) {
+  const tierLabel = tier ? `${tier.charAt(0).toUpperCase()}${tier.slice(1)} tier` : 'Chrome Extension Kit';
+  const inviteUrl = 'https://github.com/' + KIT_REPO_OWNER + '/' + KIT_REPO_NAME + '/invitations';
+  const repoUrl = 'https://github.com/' + KIT_REPO_OWNER + '/' + KIT_REPO_NAME;
+  const redeemUrl = 'https://zurhaartools.com/kit/redeem';
+
+  let inviteBlock;
+  if (inviteOutcome?.status === 'invited') {
+    inviteBlock = `<p>We've sent a GitHub invitation to <strong>${escapeHtml(githubUsername)}</strong>. Accept it here:</p>
+  <p style="margin: 16px 0;"><a href="${inviteUrl}" style="background: #f97316; color: #ffffff; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block;">Accept your invitation on GitHub</a></p>
+  <p style="color: #94a3b8; font-size: 14px;">Once accepted, clone the kit:</p>
+  <pre style="background: #12121a; color: #e2e8f0; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 13px;">git clone git@github.com:${KIT_REPO_OWNER}/${KIT_REPO_NAME}.git</pre>`;
+  } else if (inviteOutcome?.status === 'already_active') {
+    inviteBlock = `<p>You're already a collaborator on the repo — nothing more to do. Open it here:</p>
+  <p style="margin: 16px 0;"><a href="${repoUrl}" style="background: #f97316; color: #ffffff; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block;">Open the Chrome Extension Kit</a></p>`;
+  } else if (inviteOutcome?.status === 'bad_username') {
+    inviteBlock = `<p>We couldn't find a GitHub user matching <strong>${escapeHtml(githubUsername || '(none provided)')}</strong>. No problem — submit the correct username here and we'll send the invitation right away:</p>
+  <p style="margin: 16px 0;"><a href="${redeemUrl}" style="background: #f97316; color: #ffffff; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block;">Submit your GitHub username</a></p>
+  <p style="color: #94a3b8; font-size: 14px;">Don't have a GitHub account yet? <a href="https://github.com/join" style="color: #fb923c;">Create one free at github.com/join</a>, then come back to the link above.</p>`;
+  } else {
+    inviteBlock = `<p>We hit a snag sending your GitHub invitation. Don't worry — your purchase is recorded. Submit your GitHub username here and we'll retry:</p>
+  <p style="margin: 16px 0;"><a href="${redeemUrl}" style="background: #f97316; color: #ffffff; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block;">Submit your GitHub username</a></p>`;
+  }
+
+  return {
+    subject: 'Welcome — your Chrome Extension Kit is ready',
+    html: `<div style="font-family: -apple-system, sans-serif; max-width: 560px; margin: 0 auto; padding: 20px; color: #1f2937;">
+  <h2 style="color: #f97316;">Welcome to the Chrome Extension Kit</h2>
+  <p>Thanks for buying the <strong>${escapeHtml(tierLabel)}</strong>. You now have lifetime access to the private kit repo, including every update we ship.</p>
+  ${inviteBlock}
+  <h3 style="margin-top: 28px;">Start here</h3>
+  <ol>
+    <li>Accept the GitHub invite (above)</li>
+    <li>Clone the repo locally</li>
+    <li>Read <code>docs/00-quickstart.md</code> — it walks you from clone to a working extension in about 30 minutes</li>
+  </ol>
+  <p style="color: #94a3b8; font-size: 14px; margin-top: 24px;">Lifetime access means lifetime updates. As new docs and patterns ship, just <code>git pull</code> — no re-purchase needed.</p>
+  <p style="color: #94a3b8; font-size: 14px; margin-top: 30px;">Need help? Reply to this email or contact <a href="mailto:andreas@zurhaartools.com" style="color: #fb923c;">andreas@zurhaartools.com</a></p>
+  <p style="color: #94a3b8; font-size: 12px;">Zurhaar Tools — <a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a></p>
+</div>`,
+  };
+}
+
+// Refund-processed email. No-shame tone per V9 brief.
+function renderKitRefundEmail({ email, tier }) {
+  const tierLabel = tier ? `${tier.charAt(0).toUpperCase()}${tier.slice(1)} tier` : 'Chrome Extension Kit';
+  return {
+    subject: 'Your refund is processed',
+    html: `<div style="font-family: -apple-system, sans-serif; max-width: 560px; margin: 0 auto; padding: 20px; color: #1f2937;">
+  <h2 style="color: #f97316;">Refund processed</h2>
+  <p>Your refund for the <strong>${escapeHtml(tierLabel)}</strong> has been processed. The amount will land on your card or PayPal within a few business days, depending on your bank.</p>
+  <p>As part of the refund we've removed your access to the private kit repo on GitHub. No hard feelings — the kit wasn't right for you this time.</p>
+  <p>You're welcome back any time. If something specific was missing or didn't work for you, a one-line reply with what would have helped is genuinely useful — no obligation.</p>
+  <p style="color: #94a3b8; font-size: 14px; margin-top: 30px;">Questions? Reply to this email or contact <a href="mailto:andreas@zurhaartools.com" style="color: #fb923c;">andreas@zurhaartools.com</a></p>
+  <p style="color: #94a3b8; font-size: 12px;">Zurhaar Tools — <a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a></p>
+</div>`,
+  };
+}
+
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Append a row to kit_events. Best-effort — failures are logged, never thrown.
+async function logKitEvent(env, { kit_purchase_id, sale_id, event_type, github_status, event_data }) {
+  try {
+    await env.DB.prepare(
+      'INSERT INTO kit_events (kit_purchase_id, sale_id, event_type, github_status, event_data) VALUES (?, ?, ?, ?, ?)'
+    ).bind(
+      kit_purchase_id ?? null,
+      sale_id,
+      event_type,
+      typeof github_status === 'number' ? github_status : null,
+      event_data ? (typeof event_data === 'string' ? event_data : JSON.stringify(event_data)) : null
+    ).run();
+  } catch (e) {
+    console.error(`[KIT_EVENT_ERROR] Failed to write kit_events row | sale=${sale_id} type=${event_type}`, e.message || e);
+  }
+}
+
+// Send a Resend email. Best-effort: returns true/false but never throws.
+async function sendResendEmail(env, { to, subject, html }) {
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: 'Zurhaar Tools <andreas@zurhaartools.com>',
+        to, subject, html,
+      }),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      console.error(`[KIT_EMAIL_ERROR] Resend ${resp.status} | to=${to} subject="${subject}"`, txt);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error(`[KIT_EMAIL_ERROR] Resend fetch failed | to=${to} subject="${subject}"`, e.message || e);
+    return false;
+  }
+}
+
+// Mirror a kit refund to Google Sheets (parallel to scanner refunds).
+async function logKitRefundToSheets(env, { sale_id, tier, amount_cents, currency, test_mode }) {
+  if (!env.SHEETS_ENABLED || env.SHEETS_ENABLED !== 'true') return;
+  if (!env.GOOGLE_SHEETS_URL) return;
+  try {
+    await fetch(env.GOOGLE_SHEETS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        date: new Date().toISOString().substring(0, 10),
+        order_id: sale_id,
+        product: tier ? `Chrome Extension Kit (${tier})` : 'Chrome Extension Kit',
+        variant: 'Refund',
+        amount: -((amount_cents || 0) / 100),
+        email: '',
+        test_mode: test_mode ? 'Yes' : 'No',
+        country: '',
+        currency: (currency || 'eur').toUpperCase(),
+      }),
+      redirect: 'follow',
+    });
+  } catch (e) {
+    console.error(`[KIT_SHEETS_ERROR] Failed to log kit refund | sale=${sale_id}`, e.message || e);
+  }
+}
 
 function isAllowedOrigin(origin) {
   if (!origin) return false;
@@ -662,7 +997,7 @@ export default {
   <p><strong>Credits:</strong> ${totalCredits} scans available</p>
   <h3>How to use</h3>
   <ol>
-    <li>Install the extension: <a href="https://chromewebstore.google.com/detail/job-red-flag-detector/opcklnckbijmdlmdjgmhdnkclkehemni" style="color: #fb923c;">Chrome</a> or <a href="https://microsoftedge.microsoft.com/addons/detail/job-red-flag-detector/nnppdamkeahgdhcgjcfijjeapcijngpk" style="color: #fb923c;">Edge</a></li>
+    <li>Install the extension: ${renderStoreLinks(product)}</li>
     <li>Open the extension and paste your license key</li>
     <li>Start scanning</li>
   </ol>
@@ -909,13 +1244,15 @@ export default {
           return jsonResponse(genericResponse, 200, origin);
         }
 
-        // Build license list HTML
+        // Build license list HTML — install link per card so multi-product
+        // recoveries point each license at its own store listing.
         const licenseListHtml = licenses.results.map(l => {
           const displayName = PRODUCT_DISPLAY_NAMES[l.product] || l.product;
           return `<div style="background: #12121a; border: 1px solid #2e2e42; border-radius: 8px; padding: 16px; margin: 12px 0;">
     <p style="margin: 0 0 8px 0; color: #e2e8f0;"><strong>${displayName}</strong></p>
     <code style="color: #fb923c; font-size: 16px; word-break: break-all;">${l.license_key}</code>
     <p style="margin: 8px 0 0 0; color: #94a3b8; font-size: 14px;">${l.credits_remaining} scans remaining</p>
+    <p style="margin: 8px 0 0 0; color: #94a3b8; font-size: 14px;">Install: ${renderStoreLinks(l.product)}</p>
   </div>`;
         }).join('');
 
@@ -933,14 +1270,8 @@ export default {
               subject: 'License Key Recovery — Zurhaar Tools',
               html: `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
   <h2 style="color: #f97316;">Your license keys</h2>
-  <p>Here are the license keys associated with your email:</p>
+  <p>Here are the license keys associated with your email. Open the extension, paste the matching key, and you're back in.</p>
   ${licenseListHtml}
-  <h3>How to use</h3>
-  <ol>
-    <li>Install the extension: <a href="https://chromewebstore.google.com/detail/job-red-flag-detector/opcklnckbijmdlmdjgmhdnkclkehemni" style="color: #fb923c;">Chrome</a> or <a href="https://microsoftedge.microsoft.com/addons/detail/job-red-flag-detector/nnppdamkeahgdhcgjcfijjeapcijngpk" style="color: #fb923c;">Edge</a></li>
-    <li>Open the extension and paste your license key</li>
-    <li>Start scanning</li>
-  </ol>
   <p style="color: #94a3b8; font-size: 14px; margin-top: 30px;">Need help? Reply to this email or contact <a href="mailto:andreas@zurhaartools.com" style="color: #fb923c;">andreas@zurhaartools.com</a></p>
   <p style="color: #94a3b8; font-size: 12px;">Zurhaar Tools — <a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a></p>
 </div>`,
@@ -1021,6 +1352,546 @@ export default {
       } catch (err) {
         console.error(`[GDPR_ERROR] Customer deletion failed`, err.message || err);
         return jsonResponse({ error: 'Deletion failed' }, 500, origin);
+      }
+    }
+
+    // ──────────────────────────────────────────────
+    // Waitlist signup: collects emails for pre-launch products (Chrome Extension Kit)
+    // ──────────────────────────────────────────────
+    if (url.pathname === '/api/kit/waitlist' && request.method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({}));
+        const rawEmail = typeof body.email === 'string' ? body.email : '';
+        const email = rawEmail.trim().toLowerCase();
+        const source = typeof body.source === 'string' && body.source.trim() ? body.source.trim().slice(0, 64) : null;
+
+        // Practical RFC 5322 lite — local@domain.tld, no spaces, single @
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!email || !emailRegex.test(email) || email.length > 254) {
+          return jsonResponse({ ok: false, error: 'Please enter a valid email address.' }, 400, origin);
+        }
+
+        // Insert; on duplicate, treat as success (no enumeration leak via UX)
+        let inserted = false;
+        try {
+          const result = await env.DB.prepare(
+            'INSERT INTO kit_waitlist (email, source) VALUES (?, ?) ON CONFLICT(email) DO NOTHING'
+          ).bind(email, source).run();
+          inserted = (result.meta?.changes || 0) > 0;
+        } catch (e) {
+          console.error(`[WAITLIST_ERROR] DB insert failed | email=${email}`, e.message || e);
+          return jsonResponse({ ok: false, error: 'Could not save your email. Please try again.' }, 500, origin);
+        }
+
+        // Only send a confirmation email on first signup — repeat submissions stay silent
+        // (still 200 OK so the UI is uniform) to avoid spamming and to not leak existence.
+        if (inserted) {
+          try {
+            await fetch('https://api.resend.com/emails', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                from: 'Zurhaar Tools <andreas@zurhaartools.com>',
+                to: email,
+                subject: "You're on the list — Chrome Extension Kit",
+                html: `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+  <h2 style="color: #f97316;">You're on the list</h2>
+  <p>Thanks for signing up for the <strong>Chrome Extension Kit</strong> waitlist. We'll email you the moment it launches, including early-bird pricing reserved for people on this list.</p>
+  <p style="color: #94a3b8; font-size: 14px; margin-top: 30px;">In the meantime, check out the other Zurhaar Tools:</p>
+  <ul style="color: #94a3b8; font-size: 14px; padding-left: 20px;">
+    <li><a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a> — all products</li>
+    <li><a href="https://chromewebstore.google.com/detail/job-red-flag-detector/opcklnckbijmdlmdjgmhdnkclkehemni" style="color: #fb923c;">Job Red Flag Detector</a> — scan job postings for red flags</li>
+    <li><a href="https://zurhaartools.com/pricing#tos-scanner" style="color: #fb923c;">ToS Scanner</a> — read what you're agreeing to before you click "Accept"</li>
+  </ul>
+  <p style="color: #94a3b8; font-size: 12px; margin-top: 30px;">Zurhaar Tools — <a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a></p>
+</div>`,
+              }),
+            });
+          } catch (e) {
+            // Email failure must not fail the request — the signup is saved.
+            console.error(`[WAITLIST_EMAIL_ERROR] Failed to send confirmation | email=${email}`, e.message || e);
+          }
+          console.log(`[WAITLIST] Signup recorded | email=${email} source=${source || 'none'}`);
+        } else {
+          console.log(`[WAITLIST] Duplicate signup ignored | email=${email} source=${source || 'none'}`);
+        }
+
+        return jsonResponse({ ok: true }, 200, origin);
+      } catch (err) {
+        console.error(`[WAITLIST_ERROR] Request processing failed`, err.message || err);
+        return jsonResponse({ ok: false, error: 'Something went wrong. Please try again.' }, 500, origin);
+      }
+    }
+
+    // ──────────────────────────────────────────────
+    // Gumroad webhook: sale ping → kit_purchases + GitHub collaborator invite
+    // ──────────────────────────────────────────────
+    // Auth model: URL-secret token. Gumroad lets us set the Ping URL freely, so
+    // we configure it as `.../webhooks/gumroad/sale?token=<GUMROAD_PING_TOKEN>`
+    // and reject requests with a missing/wrong token. (HMAC layering left for
+    // post-launch — see GUMROAD_GITHUB_FLOW.md §4.)
+    if (url.pathname === '/webhooks/gumroad/sale' && request.method === 'POST') {
+      try {
+        if (!env.GUMROAD_PING_TOKEN) {
+          console.error('[KIT_SALE_ERROR] GUMROAD_PING_TOKEN not configured');
+          return jsonResponse({ error: 'Webhook not configured' }, 500, origin);
+        }
+        const token = url.searchParams.get('token') || '';
+        if (token !== env.GUMROAD_PING_TOKEN) {
+          console.warn('[KIT_SALE_AUTH] Bad/missing token on /webhooks/gumroad/sale');
+          return jsonResponse({ error: 'Unauthorized' }, 401, origin);
+        }
+
+        const rawBody = await request.text();
+        const form = parseFormBody(rawBody);
+
+        const saleId = form['sale_id'];
+        const email = form['email'] ? String(form['email']).trim().toLowerCase() : '';
+        if (!saleId || !email) {
+          console.error(`[KIT_SALE_ERROR] Missing sale_id or email | body_keys=${Object.keys(form).join(',')}`);
+          return jsonResponse({ error: 'Missing sale_id or email' }, 400, origin);
+        }
+
+        // Idempotency — return 200 on any second hit for this sale_id.
+        const existing = await env.DB.prepare(
+          'SELECT id, invite_status FROM kit_purchases WHERE sale_id = ?'
+        ).bind(saleId).first();
+        if (existing) {
+          await logKitEvent(env, {
+            kit_purchase_id: existing.id,
+            sale_id: saleId,
+            event_type: 'sale',
+            event_data: { duplicate: true, prior_invite_status: existing.invite_status },
+          });
+          return jsonResponse({ ok: true, already_processed: true }, 200, origin);
+        }
+
+        const productPermalink = form['product_permalink'] || 'chrome-extension-kit';
+        const tier = KIT_TIER_FOR_PERMALINK[productPermalink] || null;
+        const orderNumber = form['order_number'] || null;
+        const licenseKey = form['license_key'] || null;
+        const country = form['ip_country'] || form['country'] || null;
+        const currency = (form['currency'] || 'eur').toLowerCase();
+        // Gumroad sends `price` (cents) and/or `price_in_cents`. Prefer the
+        // explicit cents field; fall back to parsing `price` as float * 100.
+        let amountCents = 0;
+        if (form['price_in_cents']) {
+          amountCents = parseInt(form['price_in_cents'], 10) || 0;
+        } else if (form['price']) {
+          const f = parseFloat(form['price']);
+          amountCents = Number.isFinite(f) ? Math.round(f * 100) : 0;
+        }
+        const testMode = form['test'] === 'true' || form['test'] === '1' ? 1 : 0;
+
+        const rawUsername = extractGithubUsernameFromForm(form);
+        const githubUsername = normalizeGithubUsername(rawUsername);
+
+        // Insert the purchase row first so we have an id for event linkage.
+        const insertResult = await env.DB.prepare(
+          `INSERT INTO kit_purchases
+            (sale_id, order_number, license_key, product_permalink, tier, email,
+             github_username, amount_cents, currency, country, test_mode, invite_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+        ).bind(
+          saleId, orderNumber, licenseKey, productPermalink, tier, email,
+          githubUsername, amountCents, currency, country, testMode
+        ).run();
+        const kitPurchaseId = insertResult.meta?.last_row_id || null;
+
+        await logKitEvent(env, {
+          kit_purchase_id: kitPurchaseId,
+          sale_id: saleId,
+          event_type: 'sale',
+          event_data: {
+            tier, product_permalink: productPermalink, amount_cents: amountCents,
+            currency, country, test_mode: !!testMode,
+            raw_github_username: rawUsername, normalized_github_username: githubUsername,
+          },
+        });
+
+        // If we couldn't extract/normalize a username, mark bad_username and
+        // send the recovery email so the buyer can self-serve via /redeem.
+        let inviteOutcome;
+        if (!githubUsername) {
+          inviteOutcome = { status: 'bad_username', http_status: 0 };
+          await env.DB.prepare(
+            `UPDATE kit_purchases SET invite_status = 'bad_username',
+              last_error = ?, updated_at = datetime('now') WHERE id = ?`
+          ).bind('No GitHub username in custom_fields, or failed normalization', kitPurchaseId).run();
+          await logKitEvent(env, {
+            kit_purchase_id: kitPurchaseId,
+            sale_id: saleId,
+            event_type: 'invite_failed',
+            event_data: { reason: 'no_or_invalid_username', raw_github_username: rawUsername },
+          });
+        } else {
+          inviteOutcome = await addCollaborator(githubUsername, env);
+          if (inviteOutcome.status === 'invited') {
+            await env.DB.prepare(
+              `UPDATE kit_purchases SET invite_status = 'invited', github_invite_id = ?,
+                last_error = NULL, updated_at = datetime('now') WHERE id = ?`
+            ).bind(inviteOutcome.invite_id ?? null, kitPurchaseId).run();
+            await logKitEvent(env, {
+              kit_purchase_id: kitPurchaseId, sale_id: saleId, event_type: 'invite_sent',
+              github_status: inviteOutcome.http_status,
+              event_data: { invite_id: inviteOutcome.invite_id, username: githubUsername },
+            });
+          } else if (inviteOutcome.status === 'already_active') {
+            await env.DB.prepare(
+              `UPDATE kit_purchases SET invite_status = 'active',
+                last_error = NULL, updated_at = datetime('now') WHERE id = ?`
+            ).bind(kitPurchaseId).run();
+            await logKitEvent(env, {
+              kit_purchase_id: kitPurchaseId, sale_id: saleId, event_type: 'invite_already_active',
+              github_status: inviteOutcome.http_status,
+              event_data: { username: githubUsername },
+            });
+          } else if (inviteOutcome.status === 'bad_username') {
+            await env.DB.prepare(
+              `UPDATE kit_purchases SET invite_status = 'bad_username',
+                last_error = 'GitHub 404 user not found', updated_at = datetime('now') WHERE id = ?`
+            ).bind(kitPurchaseId).run();
+            await logKitEvent(env, {
+              kit_purchase_id: kitPurchaseId, sale_id: saleId, event_type: 'invite_failed',
+              github_status: 404, event_data: { reason: 'user_not_found', username: githubUsername },
+            });
+          } else if (inviteOutcome.status === 'blocked') {
+            await env.DB.prepare(
+              `UPDATE kit_purchases SET invite_status = 'blocked',
+                last_error = ?, updated_at = datetime('now') WHERE id = ?`
+            ).bind((inviteOutcome.detail || '').slice(0, 1000), kitPurchaseId).run();
+            await logKitEvent(env, {
+              kit_purchase_id: kitPurchaseId, sale_id: saleId, event_type: 'invite_failed',
+              github_status: 422,
+              event_data: { reason: 'github_validation_or_spam', username: githubUsername, detail: inviteOutcome.detail },
+            });
+            console.error(`[KIT_SALE_BLOCKED] GitHub 422 for username=${githubUsername} sale=${saleId} — manual review needed`);
+          } else {
+            // error — set failed; we still return 200 so Gumroad doesn't retry
+            // forever for transient GitHub issues. Andreas can re-invite via
+            // /api/kit/redeem once GitHub is back.
+            await env.DB.prepare(
+              `UPDATE kit_purchases SET invite_status = 'failed',
+                last_error = ?, updated_at = datetime('now') WHERE id = ?`
+            ).bind((inviteOutcome.detail || '').slice(0, 1000), kitPurchaseId).run();
+            await logKitEvent(env, {
+              kit_purchase_id: kitPurchaseId, sale_id: saleId, event_type: 'invite_failed',
+              github_status: inviteOutcome.http_status,
+              event_data: { reason: 'github_api_error', username: githubUsername, detail: inviteOutcome.detail },
+            });
+            console.error(`[KIT_SALE_ERROR] GitHub addCollaborator failed | sale=${saleId} status=${inviteOutcome.http_status}`, inviteOutcome.detail);
+          }
+        }
+
+        // Send confirmation email (best-effort — failure doesn't fail the request)
+        const tmpl = renderKitPurchaseEmail({ email, githubUsername, tier, inviteOutcome });
+        await sendResendEmail(env, { to: email, subject: tmpl.subject, html: tmpl.html });
+
+        console.log(`[KIT_SALE] sale=${saleId} email=${email} username=${githubUsername} tier=${tier} invite=${inviteOutcome.status}`);
+        return jsonResponse({ ok: true, sale_id: saleId, invite_status: inviteOutcome.status }, 200, origin);
+      } catch (err) {
+        console.error('[KIT_SALE_ERROR] Sale webhook processing failed', err.message || err, err.stack || '');
+        return jsonResponse({ error: 'Webhook processing failed' }, 500, origin);
+      }
+    }
+
+    // ──────────────────────────────────────────────
+    // Gumroad webhook: refund ping → remove collaborator
+    // ──────────────────────────────────────────────
+    if (url.pathname === '/webhooks/gumroad/refund' && request.method === 'POST') {
+      try {
+        if (!env.GUMROAD_PING_TOKEN) {
+          return jsonResponse({ error: 'Webhook not configured' }, 500, origin);
+        }
+        if ((url.searchParams.get('token') || '') !== env.GUMROAD_PING_TOKEN) {
+          return jsonResponse({ error: 'Unauthorized' }, 401, origin);
+        }
+        const rawBody = await request.text();
+        const form = parseFormBody(rawBody);
+        const saleId = form['sale_id'];
+        if (!saleId) {
+          return jsonResponse({ error: 'Missing sale_id' }, 400, origin);
+        }
+        const purchase = await env.DB.prepare(
+          'SELECT id, github_username, tier, email, amount_cents, currency, test_mode, refund_status FROM kit_purchases WHERE sale_id = ?'
+        ).bind(saleId).first();
+        if (!purchase) {
+          console.warn(`[KIT_REFUND] No kit_purchases row for sale=${saleId} — recording event only`);
+          await logKitEvent(env, {
+            kit_purchase_id: null, sale_id: saleId, event_type: 'refund',
+            event_data: { warning: 'no_matching_purchase' },
+          });
+          return jsonResponse({ ok: true, skipped: true }, 200, origin);
+        }
+        if (purchase.refund_status === 'refunded') {
+          return jsonResponse({ ok: true, already_processed: true }, 200, origin);
+        }
+
+        let removeResult = null;
+        if (purchase.github_username) {
+          removeResult = await removeCollaborator(purchase.github_username, env);
+        }
+
+        await env.DB.prepare(
+          `UPDATE kit_purchases SET refund_status = 'refunded', invite_status = 'revoked',
+            updated_at = datetime('now') WHERE id = ?`
+        ).bind(purchase.id).run();
+
+        await logKitEvent(env, {
+          kit_purchase_id: purchase.id, sale_id: saleId, event_type: 'refund',
+          github_status: removeResult?.http_status ?? null,
+          event_data: {
+            username: purchase.github_username,
+            remove_status: removeResult?.status || 'skipped_no_username',
+          },
+        });
+        if (removeResult?.status === 'removed') {
+          await logKitEvent(env, {
+            kit_purchase_id: purchase.id, sale_id: saleId, event_type: 'collaborator_removed',
+            github_status: removeResult.http_status,
+            event_data: { username: purchase.github_username },
+          });
+        }
+
+        await logKitRefundToSheets(env, {
+          sale_id: saleId, tier: purchase.tier, amount_cents: purchase.amount_cents,
+          currency: purchase.currency, test_mode: !!purchase.test_mode,
+        });
+
+        // Send refund-processed email (best-effort)
+        if (purchase.email) {
+          const tmpl = renderKitRefundEmail({ email: purchase.email, tier: purchase.tier });
+          await sendResendEmail(env, { to: purchase.email, subject: tmpl.subject, html: tmpl.html });
+        }
+
+        console.log(`[KIT_REFUND] sale=${saleId} username=${purchase.github_username} remove=${removeResult?.status || 'n/a'}`);
+        return jsonResponse({ ok: true, sale_id: saleId, refund_status: 'refunded' }, 200, origin);
+      } catch (err) {
+        console.error('[KIT_REFUND_ERROR] Refund webhook processing failed', err.message || err);
+        return jsonResponse({ error: 'Webhook processing failed' }, 500, origin);
+      }
+    }
+
+    // ──────────────────────────────────────────────
+    // Gumroad webhook: dispute ping → revoke (or re-invite on dispute_won)
+    // ──────────────────────────────────────────────
+    // Gumroad sends two flavours of dispute event: `dispute` (a/k/a
+    // `dispute_created`) opens it, `dispute_won` resolves it in our favour.
+    // We branch on the `resource_name` form field (which Gumroad always sets).
+    if (url.pathname === '/webhooks/gumroad/dispute' && request.method === 'POST') {
+      try {
+        if (!env.GUMROAD_PING_TOKEN) {
+          return jsonResponse({ error: 'Webhook not configured' }, 500, origin);
+        }
+        if ((url.searchParams.get('token') || '') !== env.GUMROAD_PING_TOKEN) {
+          return jsonResponse({ error: 'Unauthorized' }, 401, origin);
+        }
+        const rawBody = await request.text();
+        const form = parseFormBody(rawBody);
+        const saleId = form['sale_id'];
+        const resourceName = (form['resource_name'] || '').toLowerCase();
+        if (!saleId) {
+          return jsonResponse({ error: 'Missing sale_id' }, 400, origin);
+        }
+        const purchase = await env.DB.prepare(
+          'SELECT id, github_username, tier, email, amount_cents, currency, test_mode, refund_status FROM kit_purchases WHERE sale_id = ?'
+        ).bind(saleId).first();
+        if (!purchase) {
+          await logKitEvent(env, {
+            kit_purchase_id: null, sale_id: saleId, event_type: 'dispute',
+            event_data: { warning: 'no_matching_purchase', resource_name: resourceName },
+          });
+          return jsonResponse({ ok: true, skipped: true }, 200, origin);
+        }
+
+        const isDisputeWon = resourceName === 'dispute_won';
+
+        if (isDisputeWon) {
+          // Re-invite the buyer
+          let inviteResult = null;
+          if (purchase.github_username) {
+            inviteResult = await addCollaborator(purchase.github_username, env);
+          }
+          const newInviteStatus =
+            inviteResult?.status === 'invited' ? 'invited' :
+            inviteResult?.status === 'already_active' ? 'active' :
+            inviteResult?.status === 'bad_username' ? 'bad_username' :
+            inviteResult?.status === 'blocked' ? 'blocked' :
+            inviteResult ? 'failed' : 'pending';
+          await env.DB.prepare(
+            `UPDATE kit_purchases SET refund_status = 'dispute_won', invite_status = ?,
+              github_invite_id = COALESCE(?, github_invite_id),
+              updated_at = datetime('now') WHERE id = ?`
+          ).bind(newInviteStatus, inviteResult?.invite_id ?? null, purchase.id).run();
+          await logKitEvent(env, {
+            kit_purchase_id: purchase.id, sale_id: saleId, event_type: 'dispute_won',
+            github_status: inviteResult?.http_status ?? null,
+            event_data: { username: purchase.github_username, reinvite_status: inviteResult?.status || 'skipped_no_username' },
+          });
+          console.log(`[KIT_DISPUTE_WON] sale=${saleId} username=${purchase.github_username} reinvite=${inviteResult?.status || 'n/a'}`);
+          return jsonResponse({ ok: true, sale_id: saleId, refund_status: 'dispute_won', invite_status: newInviteStatus }, 200, origin);
+        }
+
+        // Dispute created/opened — revoke access (same as refund).
+        if (purchase.refund_status === 'disputed') {
+          return jsonResponse({ ok: true, already_processed: true }, 200, origin);
+        }
+        let removeResult = null;
+        if (purchase.github_username) {
+          removeResult = await removeCollaborator(purchase.github_username, env);
+        }
+        await env.DB.prepare(
+          `UPDATE kit_purchases SET refund_status = 'disputed', invite_status = 'revoked',
+            updated_at = datetime('now') WHERE id = ?`
+        ).bind(purchase.id).run();
+        await logKitEvent(env, {
+          kit_purchase_id: purchase.id, sale_id: saleId, event_type: 'dispute',
+          github_status: removeResult?.http_status ?? null,
+          event_data: {
+            username: purchase.github_username,
+            remove_status: removeResult?.status || 'skipped_no_username',
+            resource_name: resourceName,
+          },
+        });
+        if (removeResult?.status === 'removed') {
+          await logKitEvent(env, {
+            kit_purchase_id: purchase.id, sale_id: saleId, event_type: 'collaborator_removed',
+            github_status: removeResult.http_status,
+            event_data: { username: purchase.github_username, cause: 'dispute' },
+          });
+        }
+        await logKitRefundToSheets(env, {
+          sale_id: saleId, tier: purchase.tier, amount_cents: purchase.amount_cents,
+          currency: purchase.currency, test_mode: !!purchase.test_mode,
+        });
+        console.log(`[KIT_DISPUTE] sale=${saleId} username=${purchase.github_username} remove=${removeResult?.status || 'n/a'}`);
+        return jsonResponse({ ok: true, sale_id: saleId, refund_status: 'disputed' }, 200, origin);
+      } catch (err) {
+        console.error('[KIT_DISPUTE_ERROR] Dispute webhook processing failed', err.message || err);
+        return jsonResponse({ error: 'Webhook processing failed' }, 500, origin);
+      }
+    }
+
+    // ──────────────────────────────────────────────
+    // Self-service redeem endpoint: buyer fixes typo'd GitHub username, or
+    // submits one after creating their account post-purchase.
+    // ──────────────────────────────────────────────
+    // Auth model: requires (sale_id, email) match against an existing
+    // kit_purchases row. Email is normalized (lowercase + trim) on both sides.
+    // No license_key required at MVP — the sale_id+email pair is unguessable
+    // enough (Gumroad sale_ids are random 22-char tokens) and keeps the
+    // redemption page form simple.
+    if (url.pathname === '/api/kit/redeem' && request.method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({}));
+        const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+        const saleId = typeof body.sale_id === 'string' ? body.sale_id.trim() : '';
+        const rawUsername = typeof body.github_username === 'string' ? body.github_username : '';
+
+        if (!email || !saleId || !rawUsername) {
+          return jsonResponse({ error: 'Missing required fields: email, sale_id, github_username' }, 400, origin);
+        }
+        const githubUsername = normalizeGithubUsername(rawUsername);
+        if (!githubUsername) {
+          return jsonResponse({ error: 'invalid_username', message: 'That doesn\'t look like a valid GitHub username. Try just the username — no @, no URL.' }, 400, origin);
+        }
+
+        const purchase = await env.DB.prepare(
+          'SELECT id, email, github_username, tier, invite_status, refund_status FROM kit_purchases WHERE sale_id = ?'
+        ).bind(saleId).first();
+
+        // Uniform "not found" response — don't leak whether the sale exists.
+        if (!purchase || purchase.email !== email) {
+          console.warn(`[KIT_REDEEM] No match for sale=${saleId} email=${email}`);
+          return jsonResponse({ error: 'not_found', message: 'We couldn\'t find a purchase matching that email and order ID. Check the confirmation email from Gumroad for the exact values.' }, 404, origin);
+        }
+
+        // Refunded/disputed purchases cannot redeem — they were intentionally revoked.
+        if (purchase.refund_status === 'refunded' || purchase.refund_status === 'disputed') {
+          return jsonResponse({ error: 'refunded', message: 'This purchase was refunded or disputed and is no longer eligible for repo access.' }, 403, origin);
+        }
+
+        // If the username is changing and we previously invited the old one,
+        // remove that collaborator first to avoid leaving stale access.
+        const oldUsername = purchase.github_username;
+        if (oldUsername && oldUsername !== githubUsername) {
+          const oldRemove = await removeCollaborator(oldUsername, env);
+          await logKitEvent(env, {
+            kit_purchase_id: purchase.id, sale_id: saleId, event_type: 'collaborator_removed',
+            github_status: oldRemove.http_status,
+            event_data: { username: oldUsername, cause: 'username_change' },
+          });
+        }
+
+        const inviteOutcome = await addCollaborator(githubUsername, env);
+
+        let newInviteStatus;
+        let httpStatusForClient = 200;
+        let clientPayload;
+
+        if (inviteOutcome.status === 'invited') {
+          newInviteStatus = 'invited';
+          clientPayload = {
+            ok: true, invite_status: 'invited', github_username: githubUsername,
+            invite_url: `https://github.com/${KIT_REPO_OWNER}/${KIT_REPO_NAME}/invitations`,
+          };
+        } else if (inviteOutcome.status === 'already_active') {
+          newInviteStatus = 'active';
+          clientPayload = {
+            ok: true, invite_status: 'active', github_username: githubUsername,
+            repo_url: `https://github.com/${KIT_REPO_OWNER}/${KIT_REPO_NAME}`,
+          };
+        } else if (inviteOutcome.status === 'bad_username') {
+          newInviteStatus = 'bad_username';
+          httpStatusForClient = 404;
+          clientPayload = { error: 'github_user_not_found', message: `GitHub doesn't recognize "${githubUsername}". Double-check the spelling, or create the account at github.com/join first.` };
+        } else if (inviteOutcome.status === 'blocked') {
+          newInviteStatus = 'blocked';
+          httpStatusForClient = 422;
+          clientPayload = { error: 'github_blocked', message: 'GitHub blocked the invitation. Contact andreas@zurhaartools.com and we\'ll sort it manually.' };
+        } else {
+          newInviteStatus = 'failed';
+          httpStatusForClient = 502;
+          clientPayload = { error: 'github_api_error', message: 'GitHub is unavailable right now. Please try again in a few minutes.' };
+        }
+
+        await env.DB.prepare(
+          `UPDATE kit_purchases SET github_username = ?, invite_status = ?,
+            github_invite_id = COALESCE(?, github_invite_id),
+            last_error = ?, updated_at = datetime('now') WHERE id = ?`
+        ).bind(
+          githubUsername,
+          newInviteStatus,
+          inviteOutcome.invite_id ?? null,
+          inviteOutcome.detail ? String(inviteOutcome.detail).slice(0, 1000) : null,
+          purchase.id
+        ).run();
+
+        await logKitEvent(env, {
+          kit_purchase_id: purchase.id, sale_id: saleId, event_type: 'redeem',
+          github_status: inviteOutcome.http_status,
+          event_data: {
+            old_username: oldUsername, new_username: githubUsername,
+            invite_result: inviteOutcome.status,
+          },
+        });
+
+        // Email the buyer on success so they get the invite link in their inbox.
+        if (newInviteStatus === 'invited' || newInviteStatus === 'active') {
+          const tmpl = renderKitPurchaseEmail({
+            email, githubUsername, tier: purchase.tier, inviteOutcome,
+          });
+          await sendResendEmail(env, { to: email, subject: tmpl.subject, html: tmpl.html });
+        }
+
+        console.log(`[KIT_REDEEM] sale=${saleId} email=${email} old=${oldUsername} new=${githubUsername} result=${newInviteStatus}`);
+        return jsonResponse(clientPayload, httpStatusForClient, origin);
+      } catch (err) {
+        console.error('[KIT_REDEEM_ERROR] Redeem request failed', err.message || err);
+        return jsonResponse({ error: 'Internal error' }, 500, origin);
       }
     }
 

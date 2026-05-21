@@ -42,12 +42,38 @@ wrangler.toml             ← Worker config (D1 binding, CORS origins)
 - `/api/license` — looks up license by Stripe session ID (for success page)
 - `/api/recover` — license key recovery (resends keys to email, 5-min rate limit, uniform response to prevent enumeration)
 - `/api/admin/delete-customer` — GDPR data deletion (anonymizes customer across D1, requires ADMIN_API_KEY)
+- `/api/kit/waitlist` — pre-launch waitlist signup. POST `{ email, source? }` → `{ ok: true }`. Stores in `kit_waitlist` table (lowercased + trimmed, deduped via UNIQUE), sends confirmation email via Resend on first signup only. Duplicates silently succeed (no enumeration leak). Email failures do not fail the request. Used by the Chrome Extension Kit landing page.
+- `/webhooks/gumroad/sale` — Gumroad sale ping (form-encoded). Auth via URL token `?token=$GUMROAD_PING_TOKEN`. Idempotent on `sale_id`. Reads `custom_fields[GitHub username]`, normalizes (strips `@`, URL prefix, lowercases, validates regex), calls GitHub `PUT /collaborators` with `permission: "pull"`, persists to `kit_purchases` + `kit_events`, sends welcome email via Resend. Returns 200 even on duplicate ping. Status outcomes recorded on the row: `invited` (201), `active` (204 already collab), `bad_username` (404 GitHub user not found), `blocked` (422), `failed` (other errors).
+- `/webhooks/gumroad/refund` — Gumroad refund ping. Same URL-token auth. Looks up `kit_purchases` by `sale_id`, calls `DELETE /collaborators`, sets `refund_status='refunded'`, `invite_status='revoked'`, logs to Google Sheets (when `SHEETS_ENABLED=true`), sends refund-processed email. Idempotent.
+- `/webhooks/gumroad/dispute` — Gumroad dispute ping. Branches on `resource_name` form field: `dispute` / `dispute_created` revokes access (same as refund); `dispute_won` re-invites the collaborator.
+- `/api/kit/redeem` — self-service GitHub username submission/correction. POST `{ email, sale_id, github_username }`. Validates that `(sale_id, email)` matches an existing kit purchase, removes the old collaborator if username is changing, invites the new one. Used by buyers who typo'd their username or didn't have a GitHub account at purchase time.
 
 ## Database schema
 ```sql
-licenses (id, license_key, product, email, credits_remaining, status, last_recovery_at, created_at, updated_at)
+licenses (id, license_key, product, email, credits_remaining, status, last_recovery_at, waiver_acknowledged_at, waiver_text, created_at, updated_at)
 credit_transactions (id, license_key, change, reason, order_id, created_at)
+kit_waitlist (id, email, signed_up_at, source, confirmed, unsubscribed, product)
+kit_purchases (id, sale_id, order_number, license_key, product_permalink, tier, email,
+               github_username, github_invite_id, repo_owner, repo_name,
+               invite_status, refund_status, amount_cents, currency, country,
+               test_mode, last_error, purchased_at, created_at, updated_at)
+kit_events (id, kit_purchase_id, sale_id, event_type, github_status, event_data, occurred_at)
 ```
+
+### Kit invite_status values
+- `pending` — row inserted, no GitHub call attempted yet
+- `invited` — GitHub returned 201 (invitation created, awaiting accept)
+- `active` — GitHub returned 204 (buyer was already a collaborator)
+- `bad_username` — GitHub returned 404, or username failed normalization
+- `blocked` — GitHub returned 422 (spam/validation — needs manual review)
+- `revoked` — refund/dispute removed the collaborator
+- `failed` — transient GitHub error — re-invite via `/api/kit/redeem`
+
+### Kit refund_status values
+- `none` — no refund/dispute (normal state)
+- `refunded` — Gumroad refund ping processed, collaborator removed
+- `disputed` — Gumroad dispute ping processed, collaborator removed
+- `dispute_won` — `dispute_won` ping processed, collaborator re-invited
 
 ### License status values
 - `active` — normal, can scan
@@ -62,6 +88,29 @@ credit_transactions (id, license_key, change, reason, order_id, created_at)
 - `GOOGLE_SHEETS_URL` — Apps Script URL for sale logging
 - `ANTHROPIC_API_KEY` — Claude API for scanning
 - `ADMIN_API_KEY` — admin endpoint auth (GDPR deletion)
+- `GITHUB_KIT_PAT` — fine-grained GitHub Personal Access Token for the Chrome Extension Kit invite flow. Scoped to `andreaszurhaar/chrome-extension-kit-template` only, with `Administration: Read and write` (manages collaborators) + `Metadata: Read-only` permissions. 1-year expiry — see rotation procedure below.
+- `GUMROAD_PING_TOKEN` — random 32-char URL-secret token. Configure the Gumroad ping URLs as `https://zurhaartools-api.andreaszurhaar.workers.dev/webhooks/gumroad/sale?token=<this>` (same for `/refund` and `/dispute`). Worker rejects requests whose `?token=` query param doesn't match.
+
+### Rotation procedure — GITHUB_KIT_PAT
+The fine-grained PAT expires after 1 year. To rotate without downtime:
+1. GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
+2. Resource owner: `andreaszurhaar`. Repository access: only `chrome-extension-kit-template`.
+3. Permissions: `Administration: Read and write`, `Metadata: Read-only`. (No `Contents` write — buyers get pull access via the GitHub side, not via worker pushes.)
+4. Expiration: 1 year.
+5. Copy the token, then `npx wrangler secret put GITHUB_KIT_PAT` and paste it.
+6. Confirm with a no-op smoke test (see below).
+7. Revoke the old token: GitHub → Settings → Developer settings → Fine-grained tokens → click the old token → Revoke.
+Blast radius if leaked: attacker can add/remove collaborators on the kit repo only. They cannot push code. Worst case: unauthorized pull access. Mitigation: rotate immediately, audit collaborator list at `https://github.com/andreaszurhaar/chrome-extension-kit-template/settings/access`.
+
+### Smoke test after secret rotation / first-time setup
+```bash
+# Confirm the redeem endpoint can drive a real GitHub invite.
+curl -X POST 'https://zurhaartools-api.andreaszurhaar.workers.dev/api/kit/redeem' \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"<email-on-a-real-test-purchase>","sale_id":"<sale-id-from-same>","github_username":"andreaszurhaar"}'
+# Expect: 200 { ok: true, invite_status: 'invited' | 'active', ... }
+# Then check https://github.com/andreaszurhaar/chrome-extension-kit-template/settings/access
+```
 
 ## Deploy
 ```bash
