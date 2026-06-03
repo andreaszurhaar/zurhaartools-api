@@ -177,9 +177,28 @@ const KIT_TIER_FOR_PERMALINK = {
   'chrome-extension-kit-starter': 'starter',
   'chrome-extension-kit-pro': 'pro',
   'chrome-extension-kit-studio': 'studio',
-  // Fallback permalink if Andreas configures a single product with variants:
+  // Fallback for a single product with versions — the real tier comes from the
+  // chosen version instead (see resolveKitTier).
   'chrome-extension-kit': 'starter',
 };
+
+// Resolve the kit tier from a Gumroad sale ping. Supports both store layouts:
+//   - one product per tier   → tier comes from product_permalink
+//   - one product, 3 versions → tier comes from the chosen version, which
+//     Gumroad serialises as `variants[<category>]=<option>` (e.g. variants[Tier]=Pro)
+// A per-tier permalink wins; otherwise read the version option's name.
+function resolveKitTier(form, productPermalink) {
+  const byPermalink = KIT_TIER_FOR_PERMALINK[productPermalink];
+  if (byPermalink && productPermalink !== 'chrome-extension-kit') return byPermalink;
+  for (const key of Object.keys(form)) {
+    if (!/^variants\[.+\]$/.test(key)) continue;
+    const v = String(form[key]).toLowerCase();
+    if (v.includes('studio')) return 'studio';
+    if (v.includes('pro')) return 'pro';
+    if (v.includes('starter')) return 'starter';
+  }
+  return byPermalink || null;
+}
 
 // GitHub username rules: 1–39 chars, alphanumeric + single hyphens, can't
 // start/end with hyphen. See docs.github.com/en/admin/identity-and-access-management.
@@ -1467,7 +1486,7 @@ export default {
         }
 
         const productPermalink = form['product_permalink'] || 'chrome-extension-kit';
-        const tier = KIT_TIER_FOR_PERMALINK[productPermalink] || null;
+        const tier = resolveKitTier(form, productPermalink);
         const orderNumber = form['order_number'] || null;
         const licenseKey = form['license_key'] || null;
         const country = form['ip_country'] || form['country'] || null;
