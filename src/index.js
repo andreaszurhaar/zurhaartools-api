@@ -20,12 +20,9 @@ const STORE_LINKS = {
     edge: 'https://microsoftedge.microsoft.com/addons/detail/job-red-flag-detector/nnppdamkeahgdhcgjcfijjeapcijngpk',
   },
   'tos-scanner': {
-    // TODO(andreas): fill in once Andreas confirms the published URLs.
-    // Chrome: format is https://chromewebstore.google.com/detail/tos-scanner/<extension-id>
-    //   — get the ID from the Chrome Web Store Developer Dashboard listing.
-    // Edge: format is https://microsoftedge.microsoft.com/addons/detail/tos-scanner/<extension-id>
-    //   — Edge approval still pending as of May 21, 2026.
-    chrome: null,
+    chrome: 'https://chromewebstore.google.com/detail/tos-scanner/kcmipgpdgnphnjjeppflojmoecllppmb',
+    // TODO(andreas): add Edge URL once Edge approves.
+    // Format: https://microsoftedge.microsoft.com/addons/detail/tos-scanner/<extension-id>
     edge: null,
   },
 };
