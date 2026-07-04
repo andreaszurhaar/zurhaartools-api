@@ -1247,6 +1247,13 @@ export default {
       const genericResponse = { ok: true, message: 'If an account exists with this email, a recovery email has been sent.' };
 
       try {
+        // Per-IP rate limit — unauthenticated endpoint that sends email
+        const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+        const { success } = await env.EMAIL_RATE_LIMITER.limit({ key: ip });
+        if (!success) {
+          return jsonResponse({ error: 'Too many requests. Please try again later.' }, 429, origin);
+        }
+
         const body = await request.json();
         const { email } = body;
 
@@ -1389,6 +1396,13 @@ export default {
     // ──────────────────────────────────────────────
     if (url.pathname === '/api/kit/waitlist' && request.method === 'POST') {
       try {
+        // Per-IP rate limit — unauthenticated endpoint that sends email
+        const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+        const { success } = await env.EMAIL_RATE_LIMITER.limit({ key: ip });
+        if (!success) {
+          return jsonResponse({ ok: false, error: 'Too many requests. Please try again later.' }, 429, origin);
+        }
+
         const body = await request.json().catch(() => ({}));
         const rawEmail = typeof body.email === 'string' ? body.email : '';
         const email = rawEmail.trim().toLowerCase();
@@ -1415,18 +1429,27 @@ export default {
         // Only send a confirmation email on first signup — repeat submissions stay silent
         // (still 200 OK so the UI is uniform) to avoid spamming and to not leak existence.
         if (inserted) {
-          try {
-            await fetch('https://api.resend.com/emails', {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${env.RESEND_API_KEY}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                from: 'Zurhaar Tools <andreas@zurhaartools.com>',
-                to: email,
-                subject: "You're on the list — Chrome Extension Kit",
-                html: `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+          // Global daily cap: past 200 signups in the current UTC day, keep the
+          // row but skip the confirmation email — protects the Resend quota and
+          // sender reputation against scripted abuse.
+          const todaySignups = await env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM kit_waitlist WHERE signed_up_at >= datetime('now', 'start of day')"
+          ).first();
+          if ((todaySignups?.n ?? 0) >= 200) {
+            console.warn(`[WAITLIST] Daily email cap reached (${todaySignups?.n} signups today) — confirmation skipped | email=${email}`);
+          } else {
+            try {
+              await fetch('https://api.resend.com/emails', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  from: 'Zurhaar Tools <andreas@zurhaartools.com>',
+                  to: email,
+                  subject: "You're on the list — Chrome Extension Kit",
+                  html: `<div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
   <h2 style="color: #f97316;">You're on the list</h2>
   <p>Thanks for signing up for the <strong>Chrome Extension Kit</strong> waitlist. We'll email you the moment it launches, including early-bird pricing reserved for people on this list.</p>
   <p style="color: #94a3b8; font-size: 14px; margin-top: 30px;">In the meantime, check out the other Zurhaar Tools:</p>
@@ -1437,11 +1460,12 @@ export default {
   </ul>
   <p style="color: #94a3b8; font-size: 12px; margin-top: 30px;">Zurhaar Tools — <a href="https://zurhaartools.com" style="color: #fb923c;">zurhaartools.com</a></p>
 </div>`,
-              }),
-            });
-          } catch (e) {
-            // Email failure must not fail the request — the signup is saved.
-            console.error(`[WAITLIST_EMAIL_ERROR] Failed to send confirmation | email=${email}`, e.message || e);
+                }),
+              });
+            } catch (e) {
+              // Email failure must not fail the request — the signup is saved.
+              console.error(`[WAITLIST_EMAIL_ERROR] Failed to send confirmation | email=${email}`, e.message || e);
+            }
           }
           console.log(`[WAITLIST] Signup recorded | email=${email} source=${source || 'none'}`);
         } else {
