@@ -1187,30 +1187,43 @@ export default {
           return jsonResponse({ error: 'Analysis service temporarily unavailable' }, 502, origin);
         }
 
-        const result = await claudeResponse.json();
-        const content = result.content[0].text;
+        const result = await claudeResponse.json().catch(() => null);
+        const content = result?.content?.[0]?.text;
 
         // Parse the JSON response from Claude
         let parsed;
-        try {
-          let text = content.trim();
-          // Strip markdown code fences if present
-          const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-          if (fenceMatch) {
-            text = fenceMatch[1].trim();
-          }
-          parsed = JSON.parse(text);
-        } catch {
+        if (typeof content === 'string') {
           try {
-            const jsonMatch = content.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              parsed = JSON.parse(jsonMatch[0]);
-            } else {
-              parsed = { raw: content, error: 'Could not parse structured response' };
+            let text = content.trim();
+            // Strip markdown code fences if present
+            const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+            if (fenceMatch) {
+              text = fenceMatch[1].trim();
             }
+            parsed = JSON.parse(text);
           } catch {
-            parsed = { raw: content, error: 'Could not parse structured response' };
+            try {
+              const jsonMatch = content.match(/\{[\s\S]*\}/);
+              if (jsonMatch) {
+                parsed = JSON.parse(jsonMatch[0]);
+              }
+            } catch {
+              // Falls through to the unusable-response refund below
+            }
           }
+        }
+
+        if (!parsed || typeof parsed !== 'object') {
+          // Claude returned 200 but nothing usable (refusal, empty/non-text
+          // content, or unparseable output) — refund the credit
+          await env.DB.prepare(
+            'UPDATE licenses SET credits_remaining = credits_remaining + 1 WHERE license_key = ?'
+          ).bind(license_key).run();
+          await env.DB.prepare(
+            'INSERT INTO credit_transactions (license_key, change, reason) VALUES (?, 1, ?)'
+          ).bind(license_key, 'refund:api_error').run();
+          console.error(`[SCAN_ERROR] Claude response unusable | type=${type} key=${license_key} stop_reason=${result?.stop_reason ?? 'n/a'} has_content=${typeof content === 'string'}`);
+          return jsonResponse({ error: 'Analysis service temporarily unavailable' }, 502, origin);
         }
 
         // Get updated credit count
