@@ -162,6 +162,31 @@ Text to analyze:
 `,
 };
 
+// Refund one scan credit + ledger row atomically. Used when the Claude call
+// fails after the credit was already deducted.
+async function refundScanCredit(env, licenseKey) {
+  await env.DB.batch([
+    env.DB.prepare(
+      'UPDATE licenses SET credits_remaining = credits_remaining + 1 WHERE license_key = ?'
+    ).bind(licenseKey),
+    env.DB.prepare(
+      'INSERT INTO credit_transactions (license_key, change, reason) VALUES (?, 1, ?)'
+    ).bind(licenseKey, 'refund:api_error'),
+  ]);
+}
+
+// Constant-time comparison for secrets (Workers-specific
+// crypto.subtle.timingSafeEqual). Length mismatch returns false without the
+// timing-safe path — only content comparison leaks timing.
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  if (ab.byteLength !== bb.byteLength) return false;
+  return crypto.subtle.timingSafeEqual(ab, bb);
+}
+
 // ──────────────────────────────────────────────
 // Chrome Extension Kit (Gumroad → GitHub) constants
 // ──────────────────────────────────────────────
@@ -170,6 +195,30 @@ Text to analyze:
 const KIT_REPO_OWNER = 'andreaszurhaar';
 const KIT_REPO_NAME = 'chrome-extension-kit-template';
 const KIT_GITHUB_UA = 'zurhaartools-kit-invite/1.0';
+
+// Our Gumroad account's seller_id (public identifier, see ZURHAARTOOLS.md
+// Business Identifiers). Pings carrying a different seller_id are rejected —
+// second factor next to the URL token.
+const GUMROAD_SELLER_ID = 'idQwRwHy0WbYATtaNfsC6A==';
+
+// Shared auth gate for the three Gumroad webhook routes.
+// Returns an error Response, or null when the request is authentic.
+function gumroadAuthError(url, form, env, origin, routeTag) {
+  if (!env.GUMROAD_PING_TOKEN) {
+    console.error(`[${routeTag}] GUMROAD_PING_TOKEN not configured`);
+    return jsonResponse({ error: 'Webhook not configured' }, 500, origin);
+  }
+  if (!timingSafeEqual(url.searchParams.get('token') || '', env.GUMROAD_PING_TOKEN)) {
+    console.warn(`[${routeTag}] Bad/missing token`);
+    return jsonResponse({ error: 'Unauthorized' }, 401, origin);
+  }
+  const sellerId = form['seller_id'];
+  if (sellerId && sellerId !== GUMROAD_SELLER_ID) {
+    console.warn(`[${routeTag}] seller_id mismatch: ${String(sellerId).slice(0, 40)}`);
+    return jsonResponse({ error: 'Unauthorized' }, 401, origin);
+  }
+  return null;
+}
 
 // Map Gumroad product_permalink → kit tier. Add new permalinks as we publish
 // additional tiers on Gumroad. Falls back to null (recorded as-is).
@@ -566,13 +615,14 @@ async function handleRefund(event, env, origin) {
   const newCredits = license.credits_remaining - creditsToDeduct;
   const newStatus = newCredits <= 0 ? 'suspended' : 'active';
 
-  await env.DB.prepare(
-    'UPDATE licenses SET credits_remaining = ?, status = ?, updated_at = datetime(\'now\') WHERE license_key = ?'
-  ).bind(newCredits, newStatus, licenseKey).run();
-
-  await env.DB.prepare(
-    'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
-  ).bind(licenseKey, -creditsToDeduct, `refund:${chargeId}`, chargeId).run();
+  await env.DB.batch([
+    env.DB.prepare(
+      'UPDATE licenses SET credits_remaining = ?, status = ?, updated_at = datetime(\'now\') WHERE license_key = ?'
+    ).bind(newCredits, newStatus, licenseKey),
+    env.DB.prepare(
+      'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
+    ).bind(licenseKey, -creditsToDeduct, `refund:${chargeId}`, chargeId),
+  ]);
 
   // Log refund as negative sale in Google Sheets
   const productName = PRODUCT_DISPLAY_NAMES[license.product] || license.product;
@@ -666,13 +716,14 @@ async function handleDisputeCreated(event, env, origin) {
   const creditsRevoked = license.credits_remaining;
 
   // Revoke immediately — zero out credits, set status to revoked
-  await env.DB.prepare(
-    'UPDATE licenses SET credits_remaining = 0, status = \'revoked\', updated_at = datetime(\'now\') WHERE license_key = ?'
-  ).bind(licenseKey).run();
-
-  await env.DB.prepare(
-    'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
-  ).bind(licenseKey, -creditsRevoked, `chargeback:${disputeId}`, disputeId).run();
+  await env.DB.batch([
+    env.DB.prepare(
+      'UPDATE licenses SET credits_remaining = 0, status = \'revoked\', updated_at = datetime(\'now\') WHERE license_key = ?'
+    ).bind(licenseKey),
+    env.DB.prepare(
+      'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
+    ).bind(licenseKey, -creditsRevoked, `chargeback:${disputeId}`, disputeId),
+  ]);
 
   // Log chargeback as negative sale
   const productName = PRODUCT_DISPLAY_NAMES[license.product] || license.product;
@@ -749,13 +800,14 @@ async function handleDisputeClosed(event, env, origin) {
     return jsonResponse({ ok: true, already_processed: true }, 200, origin);
   }
 
-  await env.DB.prepare(
-    'UPDATE licenses SET credits_remaining = credits_remaining + ?, status = \'active\', updated_at = datetime(\'now\') WHERE license_key = ?'
-  ).bind(creditsToRestore, licenseKey).run();
-
-  await env.DB.prepare(
-    'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
-  ).bind(licenseKey, creditsToRestore, `chargeback_reversed:${disputeId}`, disputeId).run();
+  await env.DB.batch([
+    env.DB.prepare(
+      'UPDATE licenses SET credits_remaining = credits_remaining + ?, status = \'active\', updated_at = datetime(\'now\') WHERE license_key = ?'
+    ).bind(creditsToRestore, licenseKey),
+    env.DB.prepare(
+      'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
+    ).bind(licenseKey, creditsToRestore, `chargeback_reversed:${disputeId}`, disputeId),
+  ]);
 
   console.log(`[CHARGEBACK] Dispute won, license reinstated | dispute=${disputeId} license=${licenseKey} credits_restored=${creditsToRestore}`);
   return jsonResponse({ ok: true, license_key: licenseKey, credits_restored: creditsToRestore, status: 'active' }, 200, origin);
@@ -809,7 +861,7 @@ export default {
           );
           const signed = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
           const expected = Array.from(new Uint8Array(signed)).map(b => b.toString(16).padStart(2, '0')).join('');
-          if (expected === sig) {
+          if (sig && timingSafeEqual(expected, sig)) {
             signatureValid = true;
             break;
           }
@@ -912,6 +964,7 @@ export default {
         ).bind(email, product).first();
 
         let licenseKey;
+        let licenseStmt;
 
         if (existingLicense) {
           licenseKey = existingLicense.license_key;
@@ -920,20 +973,25 @@ export default {
           // Persist the latest waiver acknowledgement on top-up, only when present
           // (the consumer ticked the box on this purchase). COALESCE preserves the
           // most recent prior waiver if this session lacked one.
-          await env.DB.prepare(
+          licenseStmt = env.DB.prepare(
             'UPDATE licenses SET credits_remaining = credits_remaining + ?, status = ?, waiver_acknowledged_at = COALESCE(?, waiver_acknowledged_at), waiver_text = COALESCE(?, waiver_text), updated_at = datetime(\'now\') WHERE license_key = ?'
-          ).bind(credits, newStatus, waiverAcknowledgedAt, waiverText, licenseKey).run();
+          ).bind(credits, newStatus, waiverAcknowledgedAt, waiverText, licenseKey);
         } else {
           licenseKey = crypto.randomUUID().toUpperCase();
-          await env.DB.prepare(
+          licenseStmt = env.DB.prepare(
             'INSERT INTO licenses (license_key, product, email, credits_remaining, waiver_acknowledged_at, waiver_text) VALUES (?, ?, ?, ?, ?, ?)'
-          ).bind(licenseKey, product, email, credits, waiverAcknowledgedAt, waiverText).run();
+          ).bind(licenseKey, product, email, credits, waiverAcknowledgedAt, waiverText);
         }
 
-        // Record transaction
-        await env.DB.prepare(
-          'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
-        ).bind(licenseKey, credits, `purchase:${credits}`, sessionId).run();
+        // Credit grant + ledger row in one transaction: a partial write here
+        // would dodge the idempotency check (keyed on the ledger row) and
+        // double-credit on Stripe's retry.
+        await env.DB.batch([
+          licenseStmt,
+          env.DB.prepare(
+            'INSERT INTO credit_transactions (license_key, change, reason, order_id) VALUES (?, ?, ?, ?)'
+          ).bind(licenseKey, credits, `purchase:${credits}`, sessionId),
+        ]);
 
         // Log sale to Google Sheets
         const productName = PRODUCT_DISPLAY_NAMES[product] || product;
@@ -1164,24 +1222,14 @@ export default {
           });
         } catch (fetchErr) {
           // Claude API unreachable — refund the credit
-          await env.DB.prepare(
-            'UPDATE licenses SET credits_remaining = credits_remaining + 1 WHERE license_key = ?'
-          ).bind(license_key).run();
-          await env.DB.prepare(
-            'INSERT INTO credit_transactions (license_key, change, reason) VALUES (?, 1, ?)'
-          ).bind(license_key, 'refund:api_error').run();
+          await refundScanCredit(env, license_key);
           console.error(`[SCAN_ERROR] Claude API unreachable | type=${type} key=${license_key}`, fetchErr.message || fetchErr);
           return jsonResponse({ error: 'Analysis service temporarily unavailable' }, 502, origin);
         }
 
         if (!claudeResponse.ok) {
           // Claude API error — refund the credit
-          await env.DB.prepare(
-            'UPDATE licenses SET credits_remaining = credits_remaining + 1 WHERE license_key = ?'
-          ).bind(license_key).run();
-          await env.DB.prepare(
-            'INSERT INTO credit_transactions (license_key, change, reason) VALUES (?, 1, ?)'
-          ).bind(license_key, 'refund:api_error').run();
+          await refundScanCredit(env, license_key);
           const errorText = await claudeResponse.text();
           console.error(`[SCAN_ERROR] Claude API error ${claudeResponse.status} | type=${type} key=${license_key}`, errorText);
           return jsonResponse({ error: 'Analysis service temporarily unavailable' }, 502, origin);
@@ -1216,12 +1264,7 @@ export default {
         if (!parsed || typeof parsed !== 'object') {
           // Claude returned 200 but nothing usable (refusal, empty/non-text
           // content, or unparseable output) — refund the credit
-          await env.DB.prepare(
-            'UPDATE licenses SET credits_remaining = credits_remaining + 1 WHERE license_key = ?'
-          ).bind(license_key).run();
-          await env.DB.prepare(
-            'INSERT INTO credit_transactions (license_key, change, reason) VALUES (?, 1, ?)'
-          ).bind(license_key, 'refund:api_error').run();
+          await refundScanCredit(env, license_key);
           console.error(`[SCAN_ERROR] Claude response unusable | type=${type} key=${license_key} stop_reason=${result?.stop_reason ?? 'n/a'} has_content=${typeof content === 'string'}`);
           return jsonResponse({ error: 'Analysis service temporarily unavailable' }, 502, origin);
         }
@@ -1341,7 +1384,7 @@ export default {
       // Authenticate with ADMIN_API_KEY
       const authHeader = request.headers.get('Authorization') || '';
       const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-      if (!token || token !== env.ADMIN_API_KEY) {
+      if (!token || !env.ADMIN_API_KEY || !timingSafeEqual(token, env.ADMIN_API_KEY)) {
         return jsonResponse({ error: 'Unauthorized' }, 401, origin);
       }
 
@@ -1482,24 +1525,16 @@ export default {
     // ──────────────────────────────────────────────
     // Gumroad webhook: sale ping → kit_purchases + GitHub collaborator invite
     // ──────────────────────────────────────────────
-    // Auth model: URL-secret token. Gumroad lets us set the Ping URL freely, so
-    // we configure it as `.../webhooks/gumroad/sale?token=<GUMROAD_PING_TOKEN>`
-    // and reject requests with a missing/wrong token. (HMAC layering left for
-    // post-launch — see GUMROAD_GITHUB_FLOW.md §4.)
+    // Auth model: URL-secret token (constant-time compare) + seller_id pin.
+    // Gumroad lets us set the Ping URL freely, so we configure it as
+    // `.../webhooks/gumroad/sale?token=<GUMROAD_PING_TOKEN>`. Gumroad Ping has
+    // no HMAC signing, so the token + seller_id pair is the auth boundary.
     if (url.pathname === '/webhooks/gumroad/sale' && request.method === 'POST') {
       try {
-        if (!env.GUMROAD_PING_TOKEN) {
-          console.error('[KIT_SALE_ERROR] GUMROAD_PING_TOKEN not configured');
-          return jsonResponse({ error: 'Webhook not configured' }, 500, origin);
-        }
-        const token = url.searchParams.get('token') || '';
-        if (token !== env.GUMROAD_PING_TOKEN) {
-          console.warn('[KIT_SALE_AUTH] Bad/missing token on /webhooks/gumroad/sale');
-          return jsonResponse({ error: 'Unauthorized' }, 401, origin);
-        }
-
         const rawBody = await request.text();
         const form = parseFormBody(rawBody);
+        const authError = gumroadAuthError(url, form, env, origin, 'KIT_SALE_AUTH');
+        if (authError) return authError;
 
         const saleId = form['sale_id'];
         const email = form['email'] ? String(form['email']).trim().toLowerCase() : '';
@@ -1656,14 +1691,10 @@ export default {
     // ──────────────────────────────────────────────
     if (url.pathname === '/webhooks/gumroad/refund' && request.method === 'POST') {
       try {
-        if (!env.GUMROAD_PING_TOKEN) {
-          return jsonResponse({ error: 'Webhook not configured' }, 500, origin);
-        }
-        if ((url.searchParams.get('token') || '') !== env.GUMROAD_PING_TOKEN) {
-          return jsonResponse({ error: 'Unauthorized' }, 401, origin);
-        }
         const rawBody = await request.text();
         const form = parseFormBody(rawBody);
+        const authError = gumroadAuthError(url, form, env, origin, 'KIT_REFUND_AUTH');
+        if (authError) return authError;
         const saleId = form['sale_id'];
         if (!saleId) {
           return jsonResponse({ error: 'Missing sale_id' }, 400, origin);
@@ -1736,14 +1767,10 @@ export default {
     // We branch on the `resource_name` form field (which Gumroad always sets).
     if (url.pathname === '/webhooks/gumroad/dispute' && request.method === 'POST') {
       try {
-        if (!env.GUMROAD_PING_TOKEN) {
-          return jsonResponse({ error: 'Webhook not configured' }, 500, origin);
-        }
-        if ((url.searchParams.get('token') || '') !== env.GUMROAD_PING_TOKEN) {
-          return jsonResponse({ error: 'Unauthorized' }, 401, origin);
-        }
         const rawBody = await request.text();
         const form = parseFormBody(rawBody);
+        const authError = gumroadAuthError(url, form, env, origin, 'KIT_DISPUTE_AUTH');
+        if (authError) return authError;
         const saleId = form['sale_id'];
         const resourceName = (form['resource_name'] || '').toLowerCase();
         if (!saleId) {

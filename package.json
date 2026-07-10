@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "vitest run"
   },
   "keywords": [],
   "author": "",
@@ -14,5 +15,10 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
     "wrangler": "^4.83.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.4",
+    "msw": "^2.15.0",
+    "vitest": "^4.1.10"
   }
 }

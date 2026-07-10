@@ -43,7 +43,7 @@ wrangler.toml             ← Worker config (D1 binding, CORS origins)
 - `/api/recover` — license key recovery (resends keys to email, 5-min rate limit, uniform response to prevent enumeration)
 - `/api/admin/delete-customer` — GDPR data deletion (anonymizes customer across D1, requires ADMIN_API_KEY)
 - `/api/kit/waitlist` — pre-launch waitlist signup. POST `{ email, source? }` → `{ ok: true }`. Stores in `kit_waitlist` table (lowercased + trimmed, deduped via UNIQUE), sends confirmation email via Resend on first signup only. Duplicates silently succeed (no enumeration leak). Email failures do not fail the request. Used by the Chrome Extension Kit landing page.
-- `/webhooks/gumroad/sale` — Gumroad sale ping (form-encoded). Auth via URL token `?token=$GUMROAD_PING_TOKEN`. Idempotent on `sale_id`. Reads `custom_fields[GitHub username]`, normalizes (strips `@`, URL prefix, lowercases, validates regex), calls GitHub `PUT /collaborators` with `permission: "pull"`, persists to `kit_purchases` + `kit_events`, sends welcome email via Resend. Returns 200 even on duplicate ping. Status outcomes recorded on the row: `invited` (201), `active` (204 already collab), `bad_username` (404 GitHub user not found), `blocked` (422), `failed` (other errors).
+- `/webhooks/gumroad/sale` — Gumroad sale ping (form-encoded). Auth via URL token `?token=$GUMROAD_PING_TOKEN` (constant-time compare) + `seller_id` pin (must match `GUMROAD_SELLER_ID` constant). Idempotent on `sale_id`. Reads `custom_fields[GitHub username]`, normalizes (strips `@`, URL prefix, lowercases, validates regex), calls GitHub `PUT /collaborators` with `permission: "pull"`, persists to `kit_purchases` + `kit_events`, sends welcome email via Resend. Returns 200 even on duplicate ping. Status outcomes recorded on the row: `invited` (201), `active` (204 already collab), `bad_username` (404 GitHub user not found), `blocked` (422), `failed` (other errors).
 - `/webhooks/gumroad/refund` — Gumroad refund ping. Same URL-token auth. Looks up `kit_purchases` by `sale_id`, calls `DELETE /collaborators`, sets `refund_status='refunded'`, `invite_status='revoked'`, logs to Google Sheets (when `SHEETS_ENABLED=true`), sends refund-processed email. Idempotent.
 - `/webhooks/gumroad/dispute` — Gumroad dispute ping. Branches on `resource_name` form field: `dispute` / `dispute_created` revokes access (same as refund); `dispute_won` re-invites the collaborator.
 - `/api/kit/redeem` — self-service GitHub username submission/correction. POST `{ email, sale_id, github_username }`. Validates that `(sale_id, email)` matches an existing kit purchase, removes the old collaborator if username is changing, invites the new one. Used by buyers who typo'd their username or didn't have a GitHub account at purchase time.
@@ -112,11 +112,12 @@ curl -X POST 'https://zurhaartools-api.andreaszurhaar.workers.dev/api/kit/redeem
 # Then check https://github.com/andreaszurhaar/chrome-extension-kit-template/settings/access
 ```
 
-## Deploy
+## Test & Deploy
 ```bash
-wrangler deploy
-# Deploys in ~15 seconds
+npm test          # money-path suite (vitest + workers pool, D1 + MSW mocks)
+wrangler deploy   # deploys in ~15 seconds
 ```
+Run the tests before every deploy.
 
 ## When adding a new product
 
