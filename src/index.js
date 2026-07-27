@@ -74,6 +74,8 @@ For each red flag found, provide:
 
 Also provide an overall score from 1-10 (1 = many red flags, 10 = looks great) and a one-sentence summary.
 
+List only the most significant findings: at most 6 red flags and 4 green flags, ordered by importance. Keep each quote under 25 words, each explanation to one sentence, and the summary to one sentence.
+
 Common red flags to look for:
 - Vague or missing salary information
 - Unrealistic experience requirements
@@ -115,6 +117,8 @@ For each red flag found, provide:
 - A severity level: "high", "medium", or "low"
 
 Also provide an overall fairness score from 1-10 (1 = many red flags, 10 = very fair) and a one-paragraph plain-language summary of the terms.
+
+List only the most significant findings: at most 6 red flags and 4 green flags, ordered by severity. Keep each quote under 25 words, each explanation to one sentence, and the summary to two sentences.
 
 Red flags to look for:
 - Data sharing with third parties or selling user data
@@ -1211,7 +1215,10 @@ export default {
             },
             body: JSON.stringify({
               model: 'claude-haiku-4-5-20251001',
-              max_tokens: 4096,
+              // Capped at 1500: the prompts limit output to ≤6 red + 4 green flags
+              // (~800 tokens typical), so this is a safety ceiling that bounds
+              // per-scan cost (~€0.012 worst case) without truncating normal responses.
+              max_tokens: 1500,
               messages: [
                 {
                   role: 'user',
