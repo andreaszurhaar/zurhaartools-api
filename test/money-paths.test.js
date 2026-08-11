@@ -361,6 +361,54 @@ describe('Gumroad sale webhook', () => {
     const { results } = await env.DB.prepare('SELECT id FROM kit_purchases WHERE sale_id = ?').bind('sale_ok_1').all();
     expect(results).toHaveLength(1);
   });
+
+  // Regression: removing a collaborator does NOT cancel a still-pending invite,
+  // and both endpoints answer 204. Revoking by removeCollaborator alone left the
+  // buyer a live invitation they could accept after being refunded — free access
+  // to a EUR 99-299 product, recorded in our own DB as 'revoked'.
+  it('cancels a still-pending invitation on refund, not just the collaborator', async () => {
+    let cancelledInviteIds = [];
+    let removeCalls = 0;
+    server.use(
+      http.put('https://api.github.com/repos/andreaszurhaar/chrome-extension-kit-template/collaborators/octocat',
+        () => HttpResponse.json({ id: 99001 }, { status: 201 })),
+      http.delete('https://api.github.com/repos/andreaszurhaar/chrome-extension-kit-template/invitations/:id',
+        ({ params }) => {
+          cancelledInviteIds.push(Number(params.id));
+          return new HttpResponse(null, { status: 204 });
+        }),
+      http.delete('https://api.github.com/repos/andreaszurhaar/chrome-extension-kit-template/collaborators/octocat',
+        () => {
+          removeCalls++;
+          return new HttpResponse(null, { status: 204 });
+        })
+    );
+
+    await salePing(validSale('sale_refund_invite_1'));
+    const sold = await env.DB.prepare('SELECT github_invite_id FROM kit_purchases WHERE sale_id = ?')
+      .bind('sale_refund_invite_1').first();
+    expect(sold.github_invite_id).toBe(99001);
+
+    const res = await SELF.fetch('https://api.test/webhooks/gumroad/refund?token=gumroad-dummy-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        sale_id: 'sale_refund_invite_1',
+        seller_id: 'idQwRwHy0WbYATtaNfsC6A==',
+      }).toString(),
+    });
+    expect(res.status).toBe(200);
+
+    // The pending invite is cancelled by id, and the accepted-collaborator path
+    // still runs (we cannot tell which state the buyer was in).
+    expect(cancelledInviteIds).toEqual([99001]);
+    expect(removeCalls).toBe(1);
+
+    const row = await env.DB.prepare('SELECT invite_status, refund_status FROM kit_purchases WHERE sale_id = ?')
+      .bind('sale_refund_invite_1').first();
+    expect(row.invite_status).toBe('revoked');
+    expect(row.refund_status).toBe('refunded');
+  });
 });
 
 describe('admin auth', () => {

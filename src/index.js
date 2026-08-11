@@ -390,6 +390,55 @@ async function removeCollaborator(username, env) {
   return { status: 'error', http_status: resp.status, detail };
 }
 
+// cancelInvitation: DELETE /repos/{owner}/{repo}/invitations/{invitation_id}
+//
+// This is NOT the same as removeCollaborator. Removing a collaborator only
+// affects someone who has ACCEPTED their invite; a still-pending invitation
+// survives it and stays acceptable afterwards. Both endpoints answer 204, so
+// revoking via removeCollaborator alone looks successful while leaving the
+// buyer a live invite — i.e. refund the purchase, then accept and keep access.
+// Idempotent: 404 means the invite was already accepted, cancelled, or expired.
+async function cancelInvitation(invitationId, env) {
+  if (!env.GITHUB_KIT_PAT) {
+    return { status: 'error', http_status: 0, detail: 'GITHUB_KIT_PAT not configured' };
+  }
+  const url = `https://api.github.com/repos/${KIT_REPO_OWNER}/${KIT_REPO_NAME}/invitations/${encodeURIComponent(invitationId)}`;
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${env.GITHUB_KIT_PAT}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': KIT_GITHUB_UA,
+      },
+    });
+  } catch (e) {
+    return { status: 'error', http_status: 0, detail: e.message || String(e) };
+  }
+  if (resp.status === 204 || resp.status === 404) {
+    return { status: 'cancelled', http_status: resp.status };
+  }
+  const detail = await resp.text().catch(() => '');
+  return { status: 'error', http_status: resp.status, detail };
+}
+
+// Full access revocation for refund / dispute. A buyer is in exactly one of two
+// states and we cannot reliably tell which from our side, so do both:
+//   - invite still pending  -> cancelInvitation() by stored invite id
+//   - invite accepted       -> removeCollaborator() by username
+// Callers must SELECT github_invite_id for the pending case to be reachable.
+async function revokeKitAccess(purchase, env) {
+  const cancelResult = purchase.github_invite_id
+    ? await cancelInvitation(purchase.github_invite_id, env)
+    : null;
+  const removeResult = purchase.github_username
+    ? await removeCollaborator(purchase.github_username, env)
+    : null;
+  return { cancelResult, removeResult };
+}
+
 // ──────────────────────────────────────────────
 // Kit email templates (Resend)
 // ──────────────────────────────────────────────
@@ -1707,7 +1756,7 @@ export default {
           return jsonResponse({ error: 'Missing sale_id' }, 400, origin);
         }
         const purchase = await env.DB.prepare(
-          'SELECT id, github_username, tier, email, amount_cents, currency, test_mode, refund_status FROM kit_purchases WHERE sale_id = ?'
+          'SELECT id, github_username, github_invite_id, tier, email, amount_cents, currency, test_mode, refund_status FROM kit_purchases WHERE sale_id = ?'
         ).bind(saleId).first();
         if (!purchase) {
           console.warn(`[KIT_REFUND] No kit_purchases row for sale=${saleId} — recording event only`);
@@ -1721,10 +1770,7 @@ export default {
           return jsonResponse({ ok: true, already_processed: true }, 200, origin);
         }
 
-        let removeResult = null;
-        if (purchase.github_username) {
-          removeResult = await removeCollaborator(purchase.github_username, env);
-        }
+        const { cancelResult, removeResult } = await revokeKitAccess(purchase, env);
 
         await env.DB.prepare(
           `UPDATE kit_purchases SET refund_status = 'refunded', invite_status = 'revoked',
@@ -1737,6 +1783,7 @@ export default {
           event_data: {
             username: purchase.github_username,
             remove_status: removeResult?.status || 'skipped_no_username',
+            invite_cancel_status: cancelResult?.status || 'skipped_no_invite_id',
           },
         });
         if (removeResult?.status === 'removed') {
@@ -1784,7 +1831,7 @@ export default {
           return jsonResponse({ error: 'Missing sale_id' }, 400, origin);
         }
         const purchase = await env.DB.prepare(
-          'SELECT id, github_username, tier, email, amount_cents, currency, test_mode, refund_status FROM kit_purchases WHERE sale_id = ?'
+          'SELECT id, github_username, github_invite_id, tier, email, amount_cents, currency, test_mode, refund_status FROM kit_purchases WHERE sale_id = ?'
         ).bind(saleId).first();
         if (!purchase) {
           await logKitEvent(env, {
@@ -1826,10 +1873,7 @@ export default {
         if (purchase.refund_status === 'disputed') {
           return jsonResponse({ ok: true, already_processed: true }, 200, origin);
         }
-        let removeResult = null;
-        if (purchase.github_username) {
-          removeResult = await removeCollaborator(purchase.github_username, env);
-        }
+        const { cancelResult, removeResult } = await revokeKitAccess(purchase, env);
         await env.DB.prepare(
           `UPDATE kit_purchases SET refund_status = 'disputed', invite_status = 'revoked',
             updated_at = datetime('now') WHERE id = ?`
@@ -1840,6 +1884,7 @@ export default {
           event_data: {
             username: purchase.github_username,
             remove_status: removeResult?.status || 'skipped_no_username',
+            invite_cancel_status: cancelResult?.status || 'skipped_no_invite_id',
             resource_name: resourceName,
           },
         });
