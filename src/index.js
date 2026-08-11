@@ -456,7 +456,8 @@ function renderKitPurchaseEmail({ email, githubUsername, tier, inviteOutcome }) 
     inviteBlock = `<p>We've sent a GitHub invitation to <strong>${escapeHtml(githubUsername)}</strong>. Accept it here:</p>
   <p style="margin: 16px 0;"><a href="${inviteUrl}" style="background: #f97316; color: #ffffff; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block;">Accept your invitation on GitHub</a></p>
   <p style="color: #94a3b8; font-size: 14px;">Once accepted, clone the kit:</p>
-  <pre style="background: #12121a; color: #e2e8f0; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 13px;">git clone git@github.com:${KIT_REPO_OWNER}/${KIT_REPO_NAME}.git</pre>`;
+  <pre style="background: #12121a; color: #e2e8f0; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 13px;">git clone https://github.com/${KIT_REPO_OWNER}/${KIT_REPO_NAME}.git</pre>
+  <p style="color: #94a3b8; font-size: 14px;">Prefer SSH? <code style="background: #12121a; color: #e2e8f0; padding: 2px 6px; border-radius: 4px; font-size: 13px;">git clone git@github.com:${KIT_REPO_OWNER}/${KIT_REPO_NAME}.git</code></p>`;
   } else if (inviteOutcome?.status === 'already_active') {
     inviteBlock = `<p>You're already a collaborator on the repo — nothing more to do. Open it here:</p>
   <p style="margin: 16px 0;"><a href="${repoUrl}" style="background: #f97316; color: #ffffff; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block;">Open the Chrome Extension Kit</a></p>`;
